@@ -3,6 +3,13 @@ from typing import cast
 import tweepy
 from tweepy.client import Response
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaOutput,
+)
 from backend.blocks.twitter._auth import (
     TEST_CREDENTIALS,
     TEST_CREDENTIALS_INPUT,
@@ -26,7 +33,6 @@ from backend.blocks.twitter._types import (
     TweetUserFieldsFilter,
 )
 from backend.blocks.twitter.tweepy_exceptions import handle_tweepy_exception
-from backend.data.block import Block, BlockCategory, BlockOutput, BlockSchemaOutput
 from backend.data.model import SchemaField
 
 
@@ -96,6 +102,7 @@ class TwitterGetTweetBlock(Block):
                     "testuser",
                 )
             },
+            effect=BlockEffect.READ,
         )
 
     @staticmethod
@@ -261,6 +268,7 @@ class TwitterGetTweetsBlock(Block):
                     {"result_count": 1},  # meta
                 )
             },
+            effect=BlockEffect.READ,
         )
 
     @staticmethod

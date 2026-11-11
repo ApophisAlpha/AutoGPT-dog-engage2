@@ -1,5 +1,17 @@
-from typing import Any
+import re
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    # Runtime import would cycle: data.execution imports backend.blocks.
+    from backend.data.execution import ExecutionContext
+
+from backend.blocks._base import (
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.llm import (
     DEFAULT_LLM_MODEL,
     TEST_CREDENTIALS,
@@ -7,17 +19,38 @@ from backend.blocks.llm import (
     AIBlockBase,
     AICredentials,
     AICredentialsField,
-    LlmModel,
+    LLMModel,
     LLMResponse,
     llm_call,
 )
-from backend.data.block import (
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
-)
 from backend.data.model import APIKeyCredentials, NodeExecutionStats, SchemaField
+
+# Minimum max_output_tokens accepted by OpenAI-compatible APIs.
+# A true/false answer fits comfortably within this budget.
+MIN_LLM_OUTPUT_TOKENS = 16
+
+
+def _parse_boolean_response(response_text: str) -> tuple[bool, str | None]:
+    """Parse an LLM response into a boolean result.
+
+    Returns a ``(result, error)`` tuple.  *error* is ``None`` when the
+    response is unambiguous; otherwise it contains a diagnostic message
+    and *result* defaults to ``False``.
+    """
+    text = response_text.strip().lower()
+    if text == "true":
+        return True, None
+    if text == "false":
+        return False, None
+
+    # Fuzzy match – use word boundaries to avoid false positives like "untrue".
+    tokens = set(re.findall(r"\b(true|false|yes|no|1|0)\b", text))
+    if tokens == {"true"} or tokens == {"yes"} or tokens == {"1"}:
+        return True, None
+    if tokens == {"false"} or tokens == {"no"} or tokens == {"0"}:
+        return False, None
+
+    return False, f"Unclear AI response: '{response_text}'"
 
 
 class AIConditionBlock(AIBlockBase):
@@ -48,7 +81,7 @@ class AIConditionBlock(AIBlockBase):
             placeholder="Leave empty to use input_value, or enter a specific value",
             default=None,
         )
-        model: LlmModel = SchemaField(
+        model: LLMModel = SchemaField(
             title="LLM Model",
             default=DEFAULT_LLM_MODEL,
             description="The language model to use for evaluating the condition.",
@@ -101,14 +134,16 @@ class AIConditionBlock(AIBlockBase):
                     reasoning=None,
                 )
             },
+            effect=BlockEffect.READ,
         )
 
     async def llm_call(
         self,
-        credentials: APIKeyCredentials,
-        llm_model: LlmModel,
+        credentials: APIKeyCredentials | None,
+        llm_model: LLMModel,
         prompt: list,
         max_tokens: int,
+        execution_context: "ExecutionContext | None" = None,
     ) -> LLMResponse:
         """Wrapper method for llm_call to enable mocking in tests."""
         return await llm_call(
@@ -117,10 +152,16 @@ class AIConditionBlock(AIBlockBase):
             prompt=prompt,
             force_json_output=False,
             max_tokens=max_tokens,
+            execution_context=execution_context,
+            on_abandoned=self.merge_stats,
         )
 
     async def run(
-        self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
+        self,
+        input_data: Input,
+        *,
+        credentials: APIKeyCredentials | None = None,
+        **kwargs,
     ) -> BlockOutput:
         """
         Evaluate the AI condition and return appropriate outputs.
@@ -162,54 +203,31 @@ class AIConditionBlock(AIBlockBase):
         ]
 
         # Call the LLM
-        try:
-            response = await self.llm_call(
-                credentials=credentials,
-                llm_model=input_data.model,
-                prompt=prompt,
-                max_tokens=10,  # We only expect a true/false response
+        response = await self.llm_call(
+            credentials=credentials,
+            llm_model=input_data.model,
+            prompt=prompt,
+            max_tokens=MIN_LLM_OUTPUT_TOKENS,
+            execution_context=kwargs.get("execution_context"),
+        )
+
+        # Record the call's usage before any output: an error output ends the
+        # run, and nothing after it would be reached.
+        self.merge_stats(
+            NodeExecutionStats(
+                input_token_count=response.prompt_tokens,
+                output_token_count=response.completion_tokens,
+                cache_read_token_count=response.cache_read_tokens,
+                cache_creation_token_count=response.cache_creation_tokens,
+                provider_cost=response.provider_cost,
             )
+        )
+        self.prompt = response.prompt
 
-            # Extract the boolean result from the response
-            response_text = response.response.strip().lower()
-            if response_text == "true":
-                result = True
-            elif response_text == "false":
-                result = False
-            else:
-                # If the response is not clear, try to interpret it using word boundaries
-                import re
-
-                # Use word boundaries to avoid false positives like 'untrue' or '10'
-                tokens = set(re.findall(r"\b(true|false|yes|no|1|0)\b", response_text))
-
-                if tokens == {"true"} or tokens == {"yes"} or tokens == {"1"}:
-                    result = True
-                elif tokens == {"false"} or tokens == {"no"} or tokens == {"0"}:
-                    result = False
-                else:
-                    # Unclear or conflicting response - default to False and yield error
-                    result = False
-                    yield "error", f"Unclear AI response: '{response.response}'"
-
-            # Update internal stats
-            self.merge_stats(
-                NodeExecutionStats(
-                    input_token_count=response.prompt_tokens,
-                    output_token_count=response.completion_tokens,
-                )
-            )
-            self.prompt = response.prompt
-
-        except Exception as e:
-            # In case of any error, default to False to be safe
-            result = False
-            # Log the error but don't fail the block execution
-            import logging
-
-            logger = logging.getLogger(__name__)
-            logger.error(f"AI condition evaluation failed: {str(e)}")
-            yield "error", f"AI evaluation failed: {str(e)}"
+        # Extract the boolean result from the response
+        result, error = _parse_boolean_response(response.response)
+        if error:
+            yield "error", error
 
         # Yield results
         yield "result", result

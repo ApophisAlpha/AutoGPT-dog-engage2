@@ -19,14 +19,16 @@ import { useSelectedScheduleView } from "./useSelectedScheduleView";
 interface Props {
   agent: LibraryAgent;
   scheduleId: string;
-  onClearSelectedRun?: () => void;
+  onScheduleDeleted?: (deletedScheduleId: string) => void;
+  onSelectRun?: (id: string) => void;
   banner?: React.ReactNode;
 }
 
 export function SelectedScheduleView({
   agent,
   scheduleId,
-  onClearSelectedRun,
+  onScheduleDeleted,
+  onSelectRun,
   banner,
 }: Props) {
   const { schedule, isLoading, error } = useSelectedScheduleView(
@@ -89,7 +91,9 @@ export function SelectedScheduleView({
                   <SelectedScheduleActions
                     agent={agent}
                     scheduleId={schedule.id}
-                    onDeleted={onClearSelectedRun}
+                    schedule={schedule}
+                    onDeleted={() => onScheduleDeleted?.(schedule.id)}
+                    onSelectRun={onSelectRun}
                   />
                 </div>
               ) : null}
@@ -99,7 +103,7 @@ export function SelectedScheduleView({
             <div id="schedule" className="scroll-mt-4">
               <RunDetailCard title="Schedule">
                 {isLoading || !schedule ? (
-                  <div className="text-neutral-500">
+                  <div className="text-foreground-tertiary">
                     <LoadingSpinner />
                   </div>
                 ) : (
@@ -110,38 +114,46 @@ export function SelectedScheduleView({
                     </div>
                     <div className="flex flex-col gap-1.5">
                       <Text variant="large-medium">Recurrence</Text>
-                      <Text variant="body" className="flex items-center gap-3">
-                        {humanizeCronExpression(schedule.cron)}{" "}
-                        <span className="text-zinc-500">•</span>{" "}
-                        <span className="text-zinc-500">
+                      <div className="flex items-center gap-3">
+                        <Text variant="body" as="span">
+                          {humanizeCronExpression(schedule.cron)}
+                        </Text>{" "}
+                        <Text variant="body" as="span" tone="muted">
+                          •
+                        </Text>{" "}
+                        <Text variant="body" as="span" tone="muted">
                           {getTimezoneDisplayName(
                             schedule.timezone || userTimezone || "UTC",
                           )}
-                        </span>
-                      </Text>
+                        </Text>
+                      </div>
                     </div>
                     <div className="flex flex-col gap-1.5">
                       <Text variant="large-medium">Next run</Text>
-                      <Text variant="body" className="flex items-center gap-3">
-                        {formatInTimezone(
-                          schedule.next_run_time,
-                          userTimezone || "UTC",
-                          {
-                            year: "numeric",
-                            month: "long",
-                            day: "numeric",
-                            hour: "2-digit",
-                            minute: "2-digit",
-                            hour12: false,
-                          },
-                        )}{" "}
-                        <span className="text-zinc-500">•</span>{" "}
-                        <span className="text-zinc-500">
+                      <div className="flex items-center gap-3">
+                        <Text variant="body" as="span">
+                          {formatInTimezone(
+                            schedule.next_run_time,
+                            userTimezone || "UTC",
+                            {
+                              year: "numeric",
+                              month: "long",
+                              day: "numeric",
+                              hour: "2-digit",
+                              minute: "2-digit",
+                              hour12: false,
+                            },
+                          )}
+                        </Text>{" "}
+                        <Text variant="body" as="span" tone="muted">
+                          •
+                        </Text>{" "}
+                        <Text variant="body" as="span" tone="muted">
                           {getTimezoneDisplayName(
                             schedule.timezone || userTimezone || "UTC",
                           )}
-                        </span>
-                      </Text>
+                        </Text>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -168,7 +180,9 @@ export function SelectedScheduleView({
           <SelectedScheduleActions
             agent={agent}
             scheduleId={schedule.id}
-            onDeleted={onClearSelectedRun}
+            schedule={schedule}
+            onDeleted={() => onScheduleDeleted?.(schedule.id)}
+            onSelectRun={onSelectRun}
           />
         </div>
       ) : null}

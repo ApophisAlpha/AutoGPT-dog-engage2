@@ -1,4 +1,10 @@
 import React from "react";
+import { YouTubeEmbed } from "@/components/molecules/YouTubeEmbed/YouTubeEmbed";
+import {
+  getYouTubeVideoId,
+  getYouTubeWatchUrl,
+  isYouTubeUrl,
+} from "@/components/molecules/YouTubeEmbed/helpers";
 import {
   OutputRenderer,
   OutputMetadata,
@@ -26,7 +32,11 @@ const videoMimeTypes = [
 ];
 
 function guessMimeType(url: string): string | null {
-  const extension = url.split(".").pop()?.toLowerCase();
+  if (url.startsWith("data:")) {
+    const mimeMatch = url.match(/^data:([^;,]+)/);
+    return mimeMatch?.[1] || null;
+  }
+  const extension = url.split(/[?#]/)[0].split(".").pop()?.toLowerCase();
   const mimeMap: Record<string, string> = {
     mp4: "video/mp4",
     webm: "video/webm",
@@ -39,7 +49,24 @@ function guessMimeType(url: string): string | null {
   return extension ? mimeMap[extension] || null : null;
 }
 
+const VIMEO_REGEX = /^https?:\/\/(?:www\.)?vimeo\.com\/(\d+)/;
+
+function isYouTubeVideoURL(url: string): boolean {
+  return /^https?:\/\//i.test(url) && getYouTubeVideoId(url) !== null;
+}
+
+function getVimeoVideoID(url: string): string | null {
+  const match = url.match(VIMEO_REGEX);
+  return match ? match[1] : null;
+}
+
+function isEmbeddableVideoURL(url: string): boolean {
+  return isYouTubeVideoURL(url) || getVimeoVideoID(url) !== null;
+}
+
 function canRenderVideo(value: unknown, metadata?: OutputMetadata): boolean {
+  if (typeof value !== "string") return false;
+
   if (
     metadata?.type === "video" ||
     (metadata?.mimeType && videoMimeTypes.includes(metadata.mimeType))
@@ -47,20 +74,25 @@ function canRenderVideo(value: unknown, metadata?: OutputMetadata): boolean {
     return true;
   }
 
-  if (typeof value === "string") {
-    if (value.startsWith("data:video/")) {
+  if (value.startsWith("data:video/")) {
+    return true;
+  }
+
+  if (isEmbeddableVideoURL(value)) {
+    return true;
+  }
+
+  if (value.startsWith("http://") || value.startsWith("https://")) {
+    const cleanURL = value.split(/[?#]/)[0].toLowerCase();
+    if (videoExtensions.some((ext) => cleanURL.endsWith(ext))) {
       return true;
     }
+  }
 
-    if (value.startsWith("http://") || value.startsWith("https://")) {
-      return videoExtensions.some((ext) => value.toLowerCase().includes(ext));
-    }
-
-    if (metadata?.filename) {
-      return videoExtensions.some((ext) =>
-        metadata.filename!.toLowerCase().endsWith(ext),
-      );
-    }
+  if (metadata?.filename) {
+    return videoExtensions.some((ext) =>
+      metadata.filename!.toLowerCase().endsWith(ext),
+    );
   }
 
   return false;
@@ -72,11 +104,53 @@ function renderVideo(
 ): React.ReactNode {
   const videoUrl = String(value);
 
+  if (isYouTubeVideoURL(videoUrl)) {
+    return (
+      <div className="group relative aspect-video w-full">
+        <YouTubeEmbed
+          url={videoUrl}
+          className="rounded-md border border-border-base"
+        />
+      </div>
+    );
+  }
+
+  // Video metadata can bring any other YouTube page here. It stays a link,
+  // like in markdown: a <video> would fetch it before consent.
+  if (isYouTubeUrl(videoUrl)) {
+    return (
+      <a
+        href={getYouTubeWatchUrl(videoUrl) ?? undefined}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-info-foreground underline"
+      >
+        {videoUrl}
+      </a>
+    );
+  }
+
+  const vimeoID = getVimeoVideoID(videoUrl);
+  if (vimeoID) {
+    return (
+      <div className="group relative aspect-video w-full">
+        <iframe
+          className="h-full w-full rounded-md border border-border-base"
+          src={`https://player.vimeo.com/video/${vimeoID}`}
+          allow="autoplay; fullscreen; picture-in-picture"
+          allowFullScreen
+          sandbox="allow-scripts allow-same-origin allow-presentation allow-fullscreen allow-popups"
+          title="Vimeo video"
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="group relative">
       <video
         controls
-        className="h-auto max-w-full rounded-md border border-gray-200"
+        className="h-auto max-w-full rounded-md border border-border-base"
         preload="metadata"
       >
         <source src={videoUrl} type={metadata?.mimeType || "video/mp4"} />
@@ -91,6 +165,15 @@ function getCopyContentVideo(
   metadata?: OutputMetadata,
 ): CopyContent | null {
   const videoUrl = String(value);
+
+  // For embeddable URLs, just copy the URL text
+  if (isEmbeddableVideoURL(videoUrl)) {
+    return {
+      mimeType: "text/plain",
+      data: videoUrl,
+      fallbackText: videoUrl,
+    };
+  }
 
   if (videoUrl.startsWith("data:")) {
     const mimeMatch = videoUrl.match(/data:([^;]+)/);
@@ -122,6 +205,14 @@ function getDownloadContentVideo(
   metadata?: OutputMetadata,
 ): DownloadContent | null {
   const videoUrl = String(value);
+
+  if (isEmbeddableVideoURL(videoUrl)) {
+    return {
+      data: new Blob([videoUrl], { type: "text/plain" }),
+      filename: metadata?.filename || "video-url.txt",
+      mimeType: "text/plain",
+    };
+  }
 
   if (videoUrl.startsWith("data:")) {
     const [mimeInfo, base64Data] = videoUrl.split(",");

@@ -1,8 +1,10 @@
 import asyncio
+import codecs
 import ipaddress
 import re
 import socket
 import ssl
+from collections.abc import Iterable
 from io import BytesIO
 from typing import Any, Callable, Optional
 from urllib.parse import ParseResult as URL
@@ -20,29 +22,58 @@ from tenacity import (
 )
 
 from backend.util.json import loads
+from backend.util.settings import Config
 
 
 class HTTPClientError(Exception):
     """4xx client errors (400-499)"""
 
-    def __init__(self, message: str, status_code: int):
+    def __init__(self, message: str, status_code: int, body: bytes | None = None):
         super().__init__(message)
         self.status_code = status_code
+        # The raw response body, so a caller can read a structured error code
+        # (e.g. OAuth's ``{"error": "invalid_grant"}``) without parsing the message.
+        self.body = body
 
 
 class HTTPServerError(Exception):
     """5xx server errors (500-599)"""
 
-    def __init__(self, message: str, status_code: int):
+    def __init__(self, message: str, status_code: int, body: bytes | None = None):
         super().__init__(message)
         self.status_code = status_code
+        self.body = body
 
 
 # Default User-Agent for all requests
+class ResponseTooLargeError(ValueError):
+    """The response body is over the caller's size limit."""
+
+    def __init__(self, limit: int):
+        super().__init__(f"Response body is larger than {limit} bytes")
+        self.limit = limit
+
+
 DEFAULT_USER_AGENT = "AutoGPT-Platform/1.0 (https://github.com/Significant-Gravitas/AutoGPT; info@agpt.co) aiohttp"
+
+# A response is read in chunks and dropped once it passes the limit, so a
+# large or endless body can't fill the process's memory before anyone checks
+# its size. Downloads share the file-size setting.
+DEFAULT_MAX_RESPONSE_BYTES = Config().max_file_size_mb * 1024 * 1024
+RESPONSE_READ_CHUNK_SIZE = 64 * 1024
 
 # Retry status codes for which we will automatically retry the request
 THROTTLE_RETRY_STATUS_CODES: set[int] = {429, 500, 502, 503, 504, 408}
+
+# Statuses meaning the request was not authenticated or not authorised. Both
+# warrant asking the user to (re)connect, so they gate the setup-card paths.
+AUTH_STATUS_CODES: set[int] = {401, 403}
+
+# Only 401 unambiguously means "this credential was rejected". A bare 403 is
+# routinely a scope decision or a WAF blocking our egress IP, both with a
+# perfectly valid token — so anything destructive or blocking keys off this
+# narrower set, never AUTH_STATUS_CODES.
+CREDENTIAL_REJECTED_STATUS_CODES: set[int] = {401}
 
 # List of IP networks to block
 BLOCKED_IP_NETWORKS = [
@@ -50,14 +81,21 @@ BLOCKED_IP_NETWORKS = [
     # IPv4 Ranges
     ipaddress.ip_network("0.0.0.0/8"),  # "This" Network
     ipaddress.ip_network("10.0.0.0/8"),  # Private-Use
+    ipaddress.ip_network("100.64.0.0/10"),  # Shared Address Space (CGNAT, RFC 6598)
     ipaddress.ip_network("127.0.0.0/8"),  # Loopback
     ipaddress.ip_network("169.254.0.0/16"),  # Link Local
     ipaddress.ip_network("172.16.0.0/12"),  # Private-Use
+    ipaddress.ip_network("192.0.0.0/24"),  # IETF Protocol Assignments
     ipaddress.ip_network("192.168.0.0/16"),  # Private-Use
+    ipaddress.ip_network("198.18.0.0/15"),  # Benchmarking
     ipaddress.ip_network("224.0.0.0/4"),  # Multicast
     ipaddress.ip_network("240.0.0.0/4"),  # Reserved for Future Use
     # IPv6 Ranges
+    ipaddress.ip_network("::/128"),  # Unspecified; Linux connects it to ::1
     ipaddress.ip_network("::1/128"),  # Loopback
+    # Local-use NAT64 (RFC 8215): it translates to addresses inside some network,
+    # and not always with the IPv4 address in the last 32 bits.
+    ipaddress.ip_network("64:ff9b:1::/48"),
     ipaddress.ip_network("fc00::/7"),  # Unique local addresses (ULA)
     ipaddress.ip_network("fe80::/10"),  # Link-local
     ipaddress.ip_network("ff00::/8"),  # Multicast
@@ -67,28 +105,186 @@ BLOCKED_IP_NETWORKS = [
 ALLOWED_SCHEMES = ["http", "https"]
 HOSTNAME_REGEX = re.compile(r"^[A-Za-z0-9.-]+$")  # Basic DNS-safe hostname pattern
 
+# The longest name DNS allows, checked before IDNA encoding.
+MAX_HOSTNAME_LENGTH = 253
+
+# An allowlist of the text encodings a remote server may name for a response
+# body we decode, by their canonical codec names (``codecs.lookup(...).name``),
+# so any alias of a listed codec matches. Anything else is decoded as UTF-8.
+ALLOWED_RESPONSE_CHARSETS = frozenset(
+    {
+        # Unicode
+        "utf-8",
+        "utf-8-sig",
+        "utf-16",
+        "utf-16-le",
+        "utf-16-be",
+        "utf-32",
+        "utf-32-le",
+        "utf-32-be",
+        "ascii",
+        # ISO-8859, Windows, KOI8 and Mac single-byte families
+        *(f"iso8859-{n}" for n in (*range(1, 12), *range(13, 17))),
+        *(f"cp{n}" for n in range(1250, 1259)),
+        "koi8-r",
+        "koi8-u",
+        "koi8-t",
+        # DOS and other legacy single-byte codepages
+        *(
+            f"cp{n}"
+            for n in (
+                437,
+                720,
+                737,
+                775,
+                850,
+                852,
+                855,
+                857,
+                858,
+                860,
+                861,
+                862,
+                863,
+                864,
+                865,
+                866,
+                869,
+                1125,
+            )
+        ),
+        "kz1048",
+        "ptcp154",
+        "hp-roman8",
+        "mac-arabic",
+        "mac-croatian",
+        "mac-cyrillic",
+        "mac-farsi",
+        "mac-greek",
+        "mac-iceland",
+        "mac-latin2",
+        "mac-roman",
+        "mac-romanian",
+        "mac-turkish",
+        # Thai
+        "tis-620",
+        "cp874",
+        # Chinese
+        "gb2312",
+        "gbk",
+        "gb18030",
+        "big5",
+        "big5hkscs",
+        "cp950",
+        # Japanese
+        "shift_jis",
+        "shift_jis_2004",
+        "shift_jisx0213",
+        "cp932",
+        "euc_jp",
+        "euc_jis_2004",
+        "euc_jisx0213",
+        "iso2022_jp",
+        "iso2022_jp_1",
+        "iso2022_jp_2",
+        "iso2022_jp_2004",
+        "iso2022_jp_3",
+        "iso2022_jp_ext",
+        # Korean
+        "euc_kr",
+        "cp949",
+        "johab",
+        "iso2022_kr",
+    }
+)
+
+# IPv6 prefixes whose last 32 bits are an IPv4 address the network may route
+# the connection to: the well-known NAT64 prefix (RFC 6052), SIIT (RFC 2765)
+# and the deprecated IPv4-compatible form (RFC 4291).
+_IPV4_IN_LOW_BITS_NETWORKS = [
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("::ffff:0:0:0/96"),
+    ipaddress.ip_network("::/96"),
+]
+
+
+def _embedded_ipv4(ip_addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 address an IPv6 address encodes, if it is a form that embeds one."""
+    if ip_addr.ipv4_mapped:
+        return ip_addr.ipv4_mapped
+    if ip_addr.sixtofour:
+        return ip_addr.sixtofour
+    if ip_addr.teredo:
+        # (server, client): the client is the host the packets are delivered to
+        return ip_addr.teredo[1]
+    if any(ip_addr in network for network in _IPV4_IN_LOW_BITS_NETWORKS):
+        return ipaddress.IPv4Address(int(ip_addr) & 0xFFFFFFFF)
+    return None
+
 
 def _is_ip_blocked(ip: str) -> bool:
     """
     Checks if the IP address is in a blocked network.
+
+    IPv6 addresses that embed an IPv4 address (IPv4-mapped ``::ffff:127.0.0.1``,
+    6to4, Teredo, NAT64, SIIT and IPv4-compatible) are also checked as that IPv4
+    address, so the IPv4 blocklist cannot be bypassed by encoding a private IPv4
+    address as IPv6.
     """
     ip_addr = ipaddress.ip_address(ip)
-    return any(ip_addr in network for network in BLOCKED_IP_NETWORKS)
+
+    if any(ip_addr in network for network in BLOCKED_IP_NETWORKS):
+        return True
+
+    if isinstance(ip_addr, ipaddress.IPv6Address):
+        embedded = _embedded_ipv4(ip_addr)
+        if embedded is not None:
+            return any(embedded in network for network in BLOCKED_IP_NETWORKS)
+
+    return False
 
 
-def _remove_insecure_headers(headers: dict, old_url: URL, new_url: URL) -> dict:
+# Lower-cased: HTTP header names are case-insensitive, so a caller passing
+# ``{"authorization": ...}`` must be stripped just like ``{"Authorization": ...}``.
+SENSITIVE_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
+
+
+def _drop_headers(headers: dict, names: Iterable[str]) -> None:
+    """Remove every key in *names* from *headers*, matching case-insensitively.
+
+    *names* is lower-cased here rather than by the caller: ``drop_headers`` is
+    public on :meth:`Requests.request`, so a caller passing ``{"Authorization"}``
+    would otherwise get a silent no-op and send the header anyway.
     """
-    Removes sensitive headers (Authorization, Proxy-Authorization, Cookie)
-    if the scheme/host/port of new_url differ from old_url.
-    """
-    if (
+    lowered = {n.lower() for n in names}
+    for key in [k for k in headers if k.lower() in lowered]:
+        headers.pop(key, None)
+
+
+def _is_cross_origin(old_url: URL, new_url: URL) -> bool:
+    """Whether a hop from *old_url* to *new_url* leaves the origin."""
+    return (
         (old_url.scheme != new_url.scheme)
         or (old_url.hostname != new_url.hostname)
         or (old_url.port != new_url.port)
-    ):
-        headers.pop("Authorization", None)
-        headers.pop("Proxy-Authorization", None)
-        headers.pop("Cookie", None)
+    )
+
+
+def _remove_insecure_headers(
+    headers: dict,
+    cross_origin: bool,
+    sensitive_headers: Iterable[str] = (),
+) -> dict:
+    """
+    Removes sensitive headers (Authorization, Proxy-Authorization, Cookie,
+    plus any names in *sensitive_headers*) when *cross_origin*.
+
+    The caller decides, so that one origin decision covers every carrier of a
+    credential: these headers, and the ``auth=``/``cookies=`` kwargs aiohttp
+    turns into headers of its own downstream of this call.
+    """
+    if cross_origin:
+        _drop_headers(headers, [*SENSITIVE_HEADERS, *sensitive_headers])
     return headers
 
 
@@ -101,7 +297,7 @@ class HostResolver(abc.AbstractResolver):
     def __init__(self, ssl_hostname: str, ip_addresses: list[str]):
         self.ssl_hostname = ssl_hostname
         self.ip_addresses = ip_addresses
-        self._default = aiohttp.AsyncResolver()
+        self._default = aiohttp.ThreadedResolver()
 
     async def resolve(self, host, port=0, family=socket.AF_INET):
         if host == self.ssl_hostname:
@@ -134,7 +330,9 @@ async def _resolve_host(hostname: str) -> list[str]:
     except socket.gaierror:
         raise ValueError(f"Unable to resolve IP address for hostname {hostname}")
 
-    ip_list = [info[4][0] for info in infos]
+    # AF_INET/AF_INET6 sockaddrs start with the address string; anything else is not
+    # an IP we could validate or connect to.
+    ip_list = [addr for info in infos if isinstance(addr := info[4][0], str)]
     ipv4 = [ip for ip in ip_list if ":" not in ip]
     ipv6 = [ip for ip in ip_list if ":" in ip]
     ip_addresses = ipv4 + ipv6
@@ -144,80 +342,122 @@ async def _resolve_host(hostname: str) -> list[str]:
     return ip_addresses
 
 
-async def validate_url(
-    url: str, trusted_origins: list[str]
+async def validate_url_host(
+    url: str, trusted_hostnames: Optional[list[str]] = None
 ) -> tuple[URL, bool, list[str]]:
     """
-    Validates the URL to prevent SSRF attacks by ensuring it does not point
-    to a private, link-local, or otherwise blocked IP address — unless
+    Validates a (URL's) host string to prevent SSRF attacks by ensuring it does not
+    point to a private, link-local, or otherwise blocked IP address — unless
     the hostname is explicitly trusted.
 
-    Returns:
-        str: The validated, canonicalized, parsed URL
-        is_trusted: Boolean indicating if the hostname is in trusted_origins
-        ip_addresses: List of IP addresses for the host; empty if the host is trusted
-    """
-    # Canonicalize URL
-    url = url.strip("/ ").replace("\\", "/")
-    parsed = urlparse(url)
-    if not parsed.scheme:
-        url = f"http://{url}"
-        parsed = urlparse(url)
+    Hosts in `trusted_hostnames` are permitted without checks.
+    All other hosts are resolved and checked against `BLOCKED_IP_NETWORKS`.
 
-    # Check scheme
+    Params:
+        url: A hostname, netloc, or URL to validate.
+             If no scheme is included, `http://` is assumed.
+        trusted_hostnames: A list of hostnames that don't require validation.
+
+    Raises:
+      ValueError:
+        - if the URL has a disallowed URL scheme
+        - if the URL/host string can't be parsed
+        - if the hostname contains invalid or unsupported (non-ASCII) characters
+        - if the host resolves to a blocked IP
+
+    Returns:
+        1. The validated, canonicalized, parsed host/URL,
+           with hostname ASCII-safe encoding
+        2. Whether the host is trusted (based on the passed `trusted_hostnames`).
+        3. List of resolved IP addresses for the host; empty if the host is trusted.
+    """
+    parsed = parse_url(url)
+
     if parsed.scheme not in ALLOWED_SCHEMES:
         raise ValueError(
-            f"Scheme '{parsed.scheme}' is not allowed. Only HTTP/HTTPS are supported."
+            f"URL scheme '{parsed.scheme}' is not allowed; allowed schemes: "
+            f"{', '.join(ALLOWED_SCHEMES)}"
         )
 
-    # Validate and IDNA encode hostname
     if not parsed.hostname:
-        raise ValueError("Invalid URL: No hostname found.")
+        raise ValueError(f"Invalid host/URL; no host in parse result: {url}")
+
+    if len(parsed.hostname.removesuffix(".")) > MAX_HOSTNAME_LENGTH:
+        raise ValueError(f"Hostname is longer than {MAX_HOSTNAME_LENGTH} characters")
 
     # IDNA encode to prevent Unicode domain attacks
     try:
         ascii_hostname = idna.encode(parsed.hostname).decode("ascii")
     except idna.IDNAError:
-        raise ValueError("Invalid hostname with unsupported characters.")
+        raise ValueError(f"Hostname '{parsed.hostname}' has unsupported characters")
 
-    # Check hostname characters
     if not HOSTNAME_REGEX.match(ascii_hostname):
-        raise ValueError("Hostname contains invalid characters.")
+        raise ValueError(f"Hostname '{parsed.hostname}' has unsupported characters")
 
-    # Check if hostname is trusted
-    is_trusted = ascii_hostname in trusted_origins
-
-    # If not trusted, validate IP addresses
-    ip_addresses: list[str] = []
-    if not is_trusted:
-        # Resolve all IP addresses for the hostname
-        ip_addresses = await _resolve_host(ascii_hostname)
-
-        # Block any IP address that belongs to a blocked range
-        for ip_str in ip_addresses:
-            if _is_ip_blocked(ip_str):
-                raise ValueError(
-                    f"Access to blocked or private IP address {ip_str} "
-                    f"for hostname {ascii_hostname} is not allowed."
-                )
-
-    # Reconstruct the netloc with IDNA-encoded hostname and preserve port
-    netloc = ascii_hostname
-    if parsed.port:
-        netloc = f"{ascii_hostname}:{parsed.port}"
-
-    return (
-        URL(
-            parsed.scheme,
-            netloc,
-            quote(parsed.path, safe="/%:@"),
-            parsed.params,
-            parsed.query,
-            parsed.fragment,
-        ),
-        is_trusted,
-        ip_addresses,
+    # Re-create parsed URL object with IDNA-encoded hostname
+    parsed = URL(
+        parsed.scheme,
+        (ascii_hostname if parsed.port is None else f"{ascii_hostname}:{parsed.port}"),
+        quote(parsed.path, safe="/%:@"),
+        parsed.params,
+        parsed.query,
+        parsed.fragment,
     )
+
+    is_trusted = trusted_hostnames and any(
+        matches_allowed_host(parsed, allowed)
+        for allowed in (
+            # Normalize + parse allowlist entries the same way for consistent matching
+            parse_url(w)
+            for w in trusted_hostnames
+        )
+    )
+
+    if is_trusted:
+        return parsed, True, []
+
+    # If not allowlisted, go ahead with host resolution and IP target check
+    return parsed, False, await resolve_and_check_blocked(ascii_hostname)
+
+
+def matches_allowed_host(url: URL, allowed: URL) -> bool:
+    if url.hostname != allowed.hostname:
+        return False
+
+    # Allow any port if not explicitly specified in the allowlist
+    if allowed.port is None:
+        return True
+
+    return url.port == allowed.port
+
+
+async def resolve_and_check_blocked(hostname: str) -> list[str]:
+    """
+    Resolves hostname to IPs and raises ValueError if any resolve to
+    a blocked network. Returns the list of resolved IP addresses.
+    """
+    ip_addresses = await _resolve_host(hostname)
+    for ip_str in ip_addresses:
+        if _is_ip_blocked(ip_str):
+            raise ValueError(
+                f"Access to blocked or private IP address {ip_str} "
+                f"for hostname {hostname} is not allowed."
+            )
+    return ip_addresses
+
+
+def parse_url(url: str) -> URL:
+    """Canonicalizes and parses a URL string."""
+    url = url.lstrip("/ ").rstrip(" ").replace("\\", "/")
+
+    # Ensure scheme is present for proper parsing.
+    # Avoid regex to sidestep CodeQL py/polynomial-redos on user-controlled
+    # input.  We only need to detect "scheme://"; urlparse() and the
+    # ALLOWED_SCHEMES check downstream handle full validation.
+    if "://" not in url:
+        url = f"http://{url}"
+
+    return urlparse(url)
 
 
 def pin_url(url: URL, ip_addresses: Optional[list[str]] = None) -> URL:
@@ -301,14 +541,43 @@ class Response:
         """
         if encoding is None:
             # Try to extract charset from headers; fall back to UTF-8
-            ctype = self.headers.get("content-type", "")
-            match = re.search(r"charset=([^\s;]+)", ctype, flags=re.I)
-            encoding = match.group(1) if match else None
+            encoding = _response_charset(self.headers.get("content-type", ""))
         return self.content.decode(encoding or "utf-8", errors="replace")
 
     @property
     def ok(self) -> bool:
         return 200 <= self.status < 300
+
+    def raise_for_status(self) -> None:
+        """Raise the same error ``Requests(raise_for_status=True)`` would have.
+
+        For callers that need to inspect an error body before deciding what a
+        status means, and only then want the standard exception.
+        """
+        if self.status >= 400:
+            raise http_status_error(self.status, self.reason, self.content)
+
+
+def _response_charset(content_type: str) -> str | None:
+    """The allowed codec a ``Content-Type`` header names, or None."""
+    match = re.search(r"charset=([^\s;]+)", content_type, flags=re.I)
+    if not match:
+        return None
+    try:
+        name = codecs.lookup(match.group(1).strip("\"'")).name
+    except LookupError:
+        return None
+    return name if name in ALLOWED_RESPONSE_CHARSETS else None
+
+
+def http_status_error(status: int, reason: str | None, body: bytes) -> Exception:
+    """Build the exception ``Requests`` raises for an HTTP error status."""
+    message = f"HTTP {status} Error: {reason}, Body: {body.decode(errors='replace')}"
+    if 400 <= status <= 499:
+        return HTTPClientError(message, status, body)
+    if 500 <= status <= 599:
+        return HTTPServerError(message, status, body)
+    return Exception(message)
 
 
 def _return_last_result(retry_state: RetryCallState) -> "Response":
@@ -340,10 +609,16 @@ class Requests:
         extra_headers: dict[str, str] | None = None,
         retry_max_wait: float = 300.0,
         retry_max_attempts: int | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        sensitive_headers: Iterable[str] = (),
     ):
+        self.max_response_bytes = max_response_bytes
+        # Headers bound to the request's origin, like ``Authorization``: a
+        # cross-origin redirect drops them along with ``SENSITIVE_HEADERS``.
+        self.sensitive_headers = frozenset(sensitive_headers)
         self.trusted_origins = []
         for url in trusted_origins or []:
-            hostname = urlparse(url).hostname
+            hostname = parse_url(url).netloc  # {host}[:{port}]
             if not hostname:
                 raise ValueError(f"Invalid URL: Unable to determine hostname of {url}")
             self.trusted_origins.append(hostname)
@@ -367,8 +642,16 @@ class Requests:
         json: Any | None = None,
         allow_redirects: bool = True,
         max_redirects: int = 10,
+        drop_headers: frozenset[str] = frozenset(),
+        max_body_bytes: int | None = None,
         **kwargs,
     ) -> Response:
+        """Send a request, following redirects through the same SSRF checks.
+
+        ``max_body_bytes`` caps how much of a response body is read, counted
+        after decompression; a longer body comes back cut to that many bytes
+        plus one, so the caller can tell it was cut.
+        """
         retry_kwargs: dict[str, Any] = {
             "wait": wait_exponential_jitter(max=self.retry_max_wait),
             "retry": retry_if_result(lambda r: r.status in THROTTLE_RETRY_STATUS_CODES),
@@ -390,6 +673,8 @@ class Requests:
                 json=json,
                 allow_redirects=allow_redirects,
                 max_redirects=max_redirects,
+                drop_headers=drop_headers,
+                max_body_bytes=max_body_bytes,
                 **kwargs,
             )
 
@@ -406,6 +691,8 @@ class Requests:
         json: Any | None = None,
         allow_redirects: bool = True,
         max_redirects: int = 10,
+        drop_headers: frozenset[str] = frozenset(),
+        max_body_bytes: int | None = None,
         **kwargs,
     ) -> Response:
         # Convert auth tuple to aiohttp.BasicAuth if necessary
@@ -441,7 +728,7 @@ class Requests:
             data = form
 
         # Validate URL and get trust status
-        parsed_url, is_trusted, ip_addresses = await validate_url(
+        parsed_url, is_trusted, ip_addresses = await validate_url_host(
             url, self.trusted_origins
         )
 
@@ -461,7 +748,7 @@ class Requests:
             resolver = HostResolver(ssl_hostname=hostname, ip_addresses=ip_addresses)
             ssl_context = ssl.create_default_context()
             connector = aiohttp.TCPConnector(resolver=resolver, ssl=ssl_context)
-        session_kwargs = {}
+        session_kwargs: dict = {}
         if connector:
             session_kwargs["connector"] = connector
 
@@ -469,6 +756,11 @@ class Requests:
         req_headers = dict(headers) if headers else {}
         if self.extra_headers is not None:
             req_headers.update(self.extra_headers)
+
+        # A cross-origin redirect already stripped these; the merge above would
+        # put them straight back, so a 302 to an attacker-controlled host would
+        # replay the caller's bearer token. Drop them again, for every hop.
+        _drop_headers(req_headers, drop_headers)
 
         # Set default User-Agent if not provided
         if "User-Agent" not in req_headers and "user-agent" not in req_headers:
@@ -494,22 +786,16 @@ class Requests:
                 json=json,
                 **kwargs,
             ) as response:
-
                 if self.raise_for_status:
                     try:
                         response.raise_for_status()
                     except ClientResponseError as e:
-                        body = await response.read()
-                        error_message = f"HTTP {response.status} Error: {response.reason}, Body: {body.decode(errors='replace')}"
-
-                        # Raise specific exceptions based on status code range
-                        if 400 <= response.status <= 499:
-                            raise HTTPClientError(error_message, response.status) from e
-                        elif 500 <= response.status <= 599:
-                            raise HTTPServerError(error_message, response.status) from e
-                        else:
-                            # Generic fallback for other HTTP errors
-                            raise Exception(error_message) from e
+                        body = await _read_body(
+                            response, self.max_response_bytes, max_body_bytes
+                        )
+                        raise http_status_error(
+                            response.status, response.reason, body
+                        ) from e
 
                 # If allowed and a redirect is received, follow the redirect manually
                 if allow_redirects and response.status in (301, 302, 303, 307, 308):
@@ -521,16 +807,39 @@ class Requests:
                         return Response(
                             response=response,
                             url=original_url,
-                            body=await response.read(),
+                            body=await _read_body(
+                                response, self.max_response_bytes, max_body_bytes
+                            ),
                         )
 
-                    # The base URL is the pinned_url we just used
-                    # so that relative redirects resolve correctly.
-                    redirect_url = urlparse(urljoin(parsed_url.geturl(), location))
+                    # Joined onto the URL just requested, so a relative
+                    # redirect resolves; parsed with ``parse_url`` because the
+                    # hop below parses it that way, and only that folds a
+                    # backslash in the authority into a slash, naming the host
+                    # that is connected to.
+                    redirect_url = parse_url(urljoin(parsed_url.geturl(), location))
+                    # Decided once, for every carrier of the credential below.
+                    cross_origin = _is_cross_origin(parsed_url, redirect_url)
                     # Carry forward the same headers but update Host
                     new_headers = _remove_insecure_headers(
-                        req_headers, parsed_url, redirect_url
+                        dict(req_headers),
+                        cross_origin,
+                        self.sensitive_headers,
                     )
+
+                    # ``auth=`` and ``cookies=`` are not headers at this point
+                    # — aiohttp builds ``Authorization`` and ``Cookie`` from
+                    # them per request, downstream of the strip above — so the
+                    # header dance cannot see either, and both would be
+                    # regenerated for the new origin. Drop them with the
+                    # headers they stand in for. Same-origin hops keep them:
+                    # ``_remove_insecure_headers`` keeps the header spellings
+                    # there too, and an authenticated same-origin redirect is
+                    # a normal flow.
+                    redirect_kwargs = dict(kwargs)
+                    if cross_origin:
+                        redirect_kwargs.pop("auth", None)
+                        redirect_kwargs.pop("cookies", None)
 
                     return await self.request(
                         method,
@@ -541,7 +850,10 @@ class Requests:
                         files=files,
                         data=data,
                         json=json,
-                        **kwargs,
+                        drop_headers=drop_headers
+                        | {k.lower() for k in req_headers.keys() - new_headers.keys()},
+                        max_body_bytes=max_body_bytes,
+                        **redirect_kwargs,
                     )
 
                 # Reset response URL to original host for clarity
@@ -554,7 +866,9 @@ class Requests:
                 return Response(
                     response=response,
                     url=original_url,
-                    body=await response.read(),
+                    body=await _read_body(
+                        response, self.max_response_bytes, max_body_bytes
+                    ),
                 )
 
     async def get(self, url: str, *args, **kwargs) -> Response:
@@ -577,3 +891,44 @@ class Requests:
 
     async def patch(self, url: str, *args, **kwargs) -> Response:
         return await self.request("PATCH", url, *args, **kwargs)
+
+
+async def _read_body(
+    response: ClientResponse, limit: int, cut_at: int | None = None
+) -> bytes:
+    """Buffer the body, refusing it as soon as it's known to be over ``limit``.
+
+    With ``cut_at`` below the limit, the body is instead cut to that many
+    bytes plus one, so the caller can tell it was cut, and never refused.
+    Both read the decompressed stream in chunks and stop at their bound, so
+    neither a long body nor a short compressed one that expands is held whole.
+    """
+    if cut_at is not None and cut_at < limit:
+        return await _read_up_to(response, cut_at + 1)
+
+    declared = response.content_length
+    if declared is not None and declared > limit and _carries_a_body(response):
+        response.close()
+        raise ResponseTooLargeError(limit)
+    body = await _read_up_to(response, limit + 1)
+    if len(body) > limit:
+        response.close()
+        raise ResponseTooLargeError(limit)
+    return body
+
+
+def _carries_a_body(response: ClientResponse) -> bool:
+    """A HEAD response, and a 1xx, 204, 205 or 304 one, declares the
+    resource's Content-Length but transfers no body."""
+    if response.method.upper() == "HEAD":
+        return False
+    return response.status >= 200 and response.status not in (204, 205, 304)
+
+
+async def _read_up_to(response: ClientResponse, size: int) -> bytes:
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(RESPONSE_READ_CHUNK_SIZE):
+        body.extend(chunk[: size - len(body)])
+        if len(body) >= size:
+            break
+    return bytes(body)

@@ -2,13 +2,42 @@ from typing import Any, Type
 
 import pytest
 
-from backend.data.block import Block, BlockSchemaInput, get_blocks
+from backend.blocks import get_blocks
+from backend.blocks._base import Block, BlockEffect, BlockSchemaInput, BlockType
+from backend.blocks.io import AgentDropdownInputBlock, AgentInputBlock
+from backend.copilot.gate.effects import STRUCTURAL_TYPES, UNREADABLE_BLOCKS
+from backend.data.block_cost_config import BLOCK_COSTS
+from backend.data.execution import ExecutionContext
+from backend.data.graph import BaseGraph
 from backend.data.model import SchemaField
+from backend.util.exceptions import InsufficientBalanceError
 from backend.util.test import execute_block_test
 
 SKIP_BLOCK_TESTS = {
     "HumanInTheLoopBlock",
 }
+
+
+async def test_execute_preserves_insufficient_balance_error_type():
+    error = InsufficientBalanceError(
+        message="Producer wording is irrelevant to classification",
+        user_id="user-1",
+        balance=0,
+        amount=1,
+    )
+
+    class BalanceFailingBlock(Block):
+        async def run(self, input_data, **kwargs):
+            raise error
+            yield
+
+    block = BalanceFailingBlock(id="credit-failure-block")
+
+    with pytest.raises(InsufficientBalanceError) as exc_info:
+        async for _ in block.execute({}, execution_context=ExecutionContext()):
+            pass
+
+    assert exc_info.value is error
 
 
 @pytest.mark.parametrize("block", get_blocks().values(), ids=lambda b: b().name)
@@ -19,6 +48,73 @@ async def test_available_blocks(block: Type[Block]):
             f"Skipping {block_instance.__class__.__name__} - requires external service"
         )
     await execute_block_test(block_instance)
+
+
+@pytest.mark.parametrize("block", get_blocks().values(), ids=lambda b: b().name)
+def test_block_declares_an_effect(block: Type[Block]):
+    instance = block()
+    name = block.__name__
+    if instance.effect is not None:
+        assert name not in UNREADABLE_BLOCKS, (
+            f"{name} is unreadable by construction; a declaration would let it "
+            f"run without asking."
+        )
+        return
+    assert instance.block_type in STRUCTURAL_TYPES or name in UNREADABLE_BLOCKS, (
+        f"{name} declares no effect. Pass effect=BlockEffect.NONE, READ, "
+        f"WORKSPACE, PLATFORM, EXTERNAL_JUDGED or EXTERNAL (see BlockEffect)."
+    )
+
+
+@pytest.mark.parametrize("block", get_blocks().values(), ids=lambda b: b().name)
+def test_effect_none_blocks_have_no_io_surface(block: Type[Block]):
+    """NONE claims pure computation, and a mock exists only to stub I/O out."""
+    instance = block()
+    if instance.effect is not BlockEffect.NONE:
+        return
+    name = instance.name
+    assert not instance.test_mock, f"{name} is effect=NONE but mocks I/O in tests."
+    assert (
+        not instance.input_schema.get_credentials_fields()
+    ), f"{name} is effect=NONE but takes credentials."
+    assert instance.webhook_config is None, f"{name} is effect=NONE but has a webhook."
+    assert (
+        instance.block_type is BlockType.STANDARD
+    ), f"{name} is effect=NONE but is a {instance.block_type.name} block."
+    assert instance.id not in BLOCK_COSTS, f"{name} is effect=NONE but costs money."
+
+
+@pytest.mark.parametrize("block", get_blocks().values(), ids=lambda b: b().name)
+def test_irreversible_blocks_are_external(block: Type[Block]):
+    instance = block()
+    if not instance.is_irreversible_action:
+        return
+    assert instance.effect in (BlockEffect.EXTERNAL_JUDGED, BlockEffect.EXTERNAL), (
+        f"{instance.name} is irreversible, so its effect must be EXTERNAL_JUDGED "
+        f"or EXTERNAL, not "
+        f"{instance.effect.name if instance.effect else 'undeclared'}."
+    )
+
+
+@pytest.mark.parametrize("block", get_blocks().values(), ids=lambda b: b().name)
+def test_irreversible_action_blocks_have_no_data_input(block: Type[Block]):
+    """An irreversible-action block's whole input dict becomes the review payload.
+
+    `data` is the key the approval card historically unwrapped to, rendering
+    that one field in place of the arguments the block goes on to execute.
+    The card no longer unwraps (see PendingReviewCard), so this is the second
+    line rather than the first; a block that genuinely needs the name can
+    delete this case once the render path is re-checked.
+    """
+    block_instance = block()
+    if not block_instance.is_irreversible_action:
+        return
+
+    assert "data" not in block_instance.input_schema.model_fields, (
+        f"{block_instance.name} is an irreversible action with a top-level 'data' "
+        f"input; rename it so the approval card cannot be read as showing only "
+        f"that field."
+    )
 
 
 @pytest.mark.parametrize("block", get_blocks().values(), ids=lambda b: b().name)
@@ -278,3 +374,113 @@ class TestAutoCredentialsFieldsValidation:
         assert "Duplicate auto_credentials kwarg_name 'credentials'" in str(
             exc_info.value
         )
+
+
+def test_agent_input_block_ignores_legacy_placeholder_values():
+    """Verify AgentInputBlock.Input.model_construct tolerates extra placeholder_values
+    for backward compatibility with existing agent JSON."""
+    legacy_data = {
+        "name": "url",
+        "value": "",
+        "description": "Enter a URL",
+        "placeholder_values": ["https://example.com"],
+    }
+    instance = AgentInputBlock.Input.model_construct(**legacy_data)
+    schema = instance.generate_schema()
+    assert (
+        "enum" not in schema
+    ), "AgentInputBlock should not produce enum from legacy placeholder_values"
+
+
+def test_dropdown_input_block_produces_enum():
+    """Verify AgentDropdownInputBlock.Input.generate_schema() produces enum
+    using the canonical 'options' field name."""
+    opts = ["Option A", "Option B"]
+    instance = AgentDropdownInputBlock.Input.model_construct(
+        name="choice", value=None, options=opts
+    )
+    schema = instance.generate_schema()
+    assert schema.get("enum") == opts
+
+
+def test_dropdown_input_block_legacy_placeholder_values_produces_enum():
+    """Verify backward compat: passing legacy 'placeholder_values' to
+    AgentDropdownInputBlock still produces enum via model_construct remap."""
+    opts = ["Option A", "Option B"]
+    instance = AgentDropdownInputBlock.Input.model_construct(
+        name="choice", value=None, placeholder_values=opts
+    )
+    schema = instance.generate_schema()
+    assert (
+        schema.get("enum") == opts
+    ), "Legacy placeholder_values should be remapped to options"
+
+
+def test_generate_schema_integration_legacy_placeholder_values():
+    """Test the full Graph._generate_schema path with legacy placeholder_values
+    on AgentInputBlock — verifies no enum leaks through the graph loading path."""
+    legacy_input_default = {
+        "name": "url",
+        "value": "",
+        "description": "Enter a URL",
+        "placeholder_values": ["https://example.com"],
+    }
+    result = BaseGraph._generate_schema(
+        (AgentInputBlock.Input, legacy_input_default),
+    )
+    url_props = result["properties"]["url"]
+    assert (
+        "enum" not in url_props
+    ), "Graph schema should not contain enum from AgentInputBlock placeholder_values"
+
+
+def test_generate_schema_integration_dropdown_produces_enum():
+    """Test the full Graph._generate_schema path with AgentDropdownInputBlock
+    — verifies enum IS produced for dropdown blocks using canonical field name."""
+    dropdown_input_default = {
+        "name": "color",
+        "value": None,
+        "options": ["Red", "Green", "Blue"],
+    }
+    result = BaseGraph._generate_schema(
+        (AgentDropdownInputBlock.Input, dropdown_input_default),
+    )
+    color_props = result["properties"]["color"]
+    assert color_props.get("enum") == [
+        "Red",
+        "Green",
+        "Blue",
+    ], "Graph schema should contain enum from AgentDropdownInputBlock"
+
+
+def test_generate_schema_integration_dropdown_legacy_placeholder_values():
+    """Test the full Graph._generate_schema path with AgentDropdownInputBlock
+    using legacy 'placeholder_values' — verifies backward compat produces enum."""
+    legacy_dropdown_input_default = {
+        "name": "color",
+        "value": None,
+        "placeholder_values": ["Red", "Green", "Blue"],
+    }
+    result = BaseGraph._generate_schema(
+        (AgentDropdownInputBlock.Input, legacy_dropdown_input_default),
+    )
+    color_props = result["properties"]["color"]
+    assert color_props.get("enum") == [
+        "Red",
+        "Green",
+        "Blue",
+    ], "Legacy placeholder_values should still produce enum via model_construct remap"
+
+
+def test_dropdown_input_block_init_legacy_placeholder_values():
+    """Verify backward compat: constructing AgentDropdownInputBlock.Input via
+    model_validate with legacy 'placeholder_values' correctly maps to 'options'."""
+    opts = ["Option A", "Option B"]
+    instance = AgentDropdownInputBlock.Input.model_validate(
+        {"name": "choice", "value": None, "placeholder_values": opts}
+    )
+    assert (
+        instance.options == opts
+    ), "Legacy placeholder_values should be remapped to options via model_validate"
+    schema = instance.generate_schema()
+    assert schema.get("enum") == opts

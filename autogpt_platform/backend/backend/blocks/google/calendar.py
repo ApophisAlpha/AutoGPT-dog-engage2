@@ -8,9 +8,10 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from pydantic import BaseModel
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
@@ -172,6 +173,7 @@ class GoogleCalendarReadEventsBlock(Block):
                 },
                 "_format_events": lambda *args, **kwargs: [test_event_dict],
             },
+            effect=BlockEffect.READ,
         )
 
     async def run(
@@ -478,6 +480,8 @@ class GoogleCalendarCreateEventBlock(Block):
                     "htmlLink": "https://calendar.google.com/calendar/event?eid=abc123",
                 }
             },
+            is_irreversible_action=True,
+            effect=BlockEffect.EXTERNAL,
         )
 
     async def run(

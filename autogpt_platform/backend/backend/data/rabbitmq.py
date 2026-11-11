@@ -1,7 +1,9 @@
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Awaitable, Optional
+from uuid import uuid4
 
 import aio_pika
 import pika
@@ -72,6 +74,83 @@ class RabbitMQConfig(BaseModel):
     vhost: str = "/"
     exchanges: list[Exchange]
     queues: list[Queue]
+
+
+def declare_broadcast_queue(
+    channel: "pika.adapters.blocking_connection.BlockingChannel",
+    exchange: Exchange,
+    instance_id: str,
+) -> str:
+    """Give this process its own queue on a fanout exchange, and return its name.
+
+    A fanout reaches every process only when every process owns a queue:
+    consumers sharing one queue are round-robined, so a broadcast lands on one
+    arbitrary instance. Exclusive and auto-delete, so the queue dies with the
+    connection that declared it — which is why callers re-declare on reconnect.
+    """
+    queue_name = f"{exchange.name}.instance.{instance_id}.{uuid4().hex[:8]}"
+    channel.queue_declare(
+        queue=queue_name, durable=False, exclusive=True, auto_delete=True
+    )
+    channel.queue_bind(queue=queue_name, exchange=exchange.name, routing_key="")
+    return queue_name
+
+
+# Only waits for the last old-image instance to drain, which is a rollout-scale
+# event; costs one passive declare per instance per interval.
+SHARED_QUEUE_REAP_INTERVAL_SECONDS = 5 * 60
+
+
+def start_shared_queue_reaper(
+    channel: "pika.adapters.blocking_connection.BlockingChannel", queue_name: str
+) -> None:
+    """Delete a retired fleet-wide queue once no instance is draining it.
+
+    Runs now and every few minutes after, on the consumer's own connection:
+    a pika ``BlockingConnection`` is not thread-safe, and ``call_later`` fires
+    from inside ``start_consuming``. An old-image instance that reconnects
+    declares that queue again, so the pass repeats while this consumer lives.
+    """
+    reap_shared_queue(channel, queue_name)
+    try:
+        channel.connection.call_later(
+            SHARED_QUEUE_REAP_INTERVAL_SECONDS,
+            lambda: start_shared_queue_reaper(channel, queue_name),
+        )
+    except Exception as e:
+        logger.debug(f"{queue_name} reaper not re-armed: {e}")
+
+
+def reap_shared_queue(
+    channel: "pika.adapters.blocking_connection.BlockingChannel", queue_name: str
+) -> bool:
+    """Delete the shared queue if it exists and nothing consumes it.
+
+    The consumer count is the rollout gate: while an old-image instance is
+    still draining that queue, deleting it would take its broadcasts away.
+    Runs on a scratch channel because a 404 from the passive declare closes
+    the channel it arrives on, and the caller's is carrying the consumer.
+    """
+    try:
+        scratch = channel.connection.channel()
+    except Exception:
+        logger.warning(f"Could not open a channel to reap {queue_name}")
+        return False
+    try:
+        queue = scratch.queue_declare(queue=queue_name, passive=True).method
+        if queue.consumer_count:
+            return False
+        # Check-then-act, because RabbitMQ refuses `if_unused` on a quorum queue:
+        # an instance that re-consumes in the gap re-declares it on reconnect.
+        scratch.queue_delete(queue=queue_name)
+        logger.info(f"Deleted retired queue {queue_name}")
+        return True
+    except Exception as e:
+        logger.debug(f"{queue_name} not reaped: {e}")
+        return False
+    finally:
+        if scratch.is_open:
+            scratch.close()
 
 
 class RabbitMQBase(ABC):
@@ -225,6 +304,10 @@ class SyncRabbitMQ(RabbitMQBase):
 class AsyncRabbitMQ(RabbitMQBase):
     """Asynchronous RabbitMQ client"""
 
+    def __init__(self, config: RabbitMQConfig):
+        super().__init__(config)
+        self._reconnect_lock: asyncio.Lock | None = None
+
     @property
     def is_connected(self) -> bool:
         return bool(self._connection and not self._connection.is_closed)
@@ -235,7 +318,17 @@ class AsyncRabbitMQ(RabbitMQBase):
 
     @conn_retry("AsyncRabbitMQ", "Acquiring async connection")
     async def connect(self):
-        if self.is_connected:
+        if self.is_connected and self._channel and not self._channel.is_closed:
+            return
+
+        if (
+            self.is_connected
+            and self._connection
+            and (self._channel is None or self._channel.is_closed)
+        ):
+            self._channel = await self._connection.channel()
+            await self._channel.set_qos(prefetch_count=1)
+            await self.declare_infrastructure()
             return
 
         self._connection = await aio_pika.connect_robust(
@@ -291,24 +384,46 @@ class AsyncRabbitMQ(RabbitMQBase):
                     exchange, routing_key=queue.routing_key or queue.name
                 )
 
-    @func_retry
-    async def publish_message(
+    @property
+    def _lock(self) -> asyncio.Lock:
+        if self._reconnect_lock is None:
+            self._reconnect_lock = asyncio.Lock()
+        return self._reconnect_lock
+
+    async def _ensure_channel(self) -> aio_pika.abc.AbstractChannel:
+        """Get a valid channel, reconnecting if the current one is stale.
+
+        Uses a lock to prevent concurrent reconnection attempts from racing.
+        """
+        if self.is_ready:
+            return self._channel  # type: ignore  # is_ready guarantees non-None
+
+        async with self._lock:
+            # Double-check after acquiring lock
+            if self.is_ready:
+                return self._channel  # type: ignore
+
+            self._channel = None
+            await self.connect()
+
+            if self._channel is None:
+                raise RuntimeError("Channel should be established after connect")
+
+            return self._channel
+
+    async def _publish_once(
         self,
         routing_key: str,
         message: str,
         exchange: Optional[Exchange] = None,
         persistent: bool = True,
     ) -> None:
-        if not self.is_ready:
-            await self.connect()
-
-        if self._channel is None:
-            raise RuntimeError("Channel should be established after connect")
+        channel = await self._ensure_channel()
 
         if exchange:
-            exchange_obj = await self._channel.get_exchange(exchange.name)
+            exchange_obj = await channel.get_exchange(exchange.name)
         else:
-            exchange_obj = self._channel.default_exchange
+            exchange_obj = channel.default_exchange
 
         await exchange_obj.publish(
             aio_pika.Message(
@@ -322,9 +437,23 @@ class AsyncRabbitMQ(RabbitMQBase):
             routing_key=routing_key,
         )
 
+    @func_retry
+    async def publish_message(
+        self,
+        routing_key: str,
+        message: str,
+        exchange: Optional[Exchange] = None,
+        persistent: bool = True,
+    ) -> None:
+        try:
+            await self._publish_once(routing_key, message, exchange, persistent)
+        except aio_pika.exceptions.ChannelInvalidStateError:
+            logger.warning(
+                "RabbitMQ channel invalid, forcing reconnect and retrying publish"
+            )
+            async with self._lock:
+                self._channel = None
+            await self._publish_once(routing_key, message, exchange, persistent)
+
     async def get_channel(self) -> aio_pika.abc.AbstractChannel:
-        if not self.is_ready:
-            await self.connect()
-        if self._channel is None:
-            raise RuntimeError("Channel should be established after connect")
-        return self._channel
+        return await self._ensure_channel()

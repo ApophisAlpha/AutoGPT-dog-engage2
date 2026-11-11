@@ -2,6 +2,8 @@ import type { CreditTransactionType } from "@/lib/autogpt-server-api";
 import { withRoleAccess } from "@/lib/withRoleAccess";
 import { Suspense } from "react";
 import { AdminUserGrantHistory } from "./components/AdminUserGrantHistory";
+import { ExportCopilotUsageButton } from "./components/ExportCopilotUsageButton";
+import { ExportCreditTransactionsButton } from "./components/ExportCreditTransactionsButton";
 
 type SpendingDashboardPageSearchParams = {
   page?: string;
@@ -23,8 +25,14 @@ function SpendingDashboard({
       <div className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-3xl font-bold">User Spending</h1>
-            <p className="text-gray-500">Manage user spending balances</p>
+            <h1 className="text-heading font-bold">User Spending</h1>
+            <p className="text-foreground-tertiary">
+              Manage user spending balances
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <ExportCreditTransactionsButton />
+            <ExportCopilotUsageButton />
           </div>
         </div>
 

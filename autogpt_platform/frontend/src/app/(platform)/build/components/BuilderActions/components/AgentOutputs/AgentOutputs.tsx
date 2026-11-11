@@ -1,8 +1,8 @@
 import { BlockUIType } from "@/app/(platform)/build/components/types";
+import { Label } from "@/components/atoms/Label/Label";
 import { useGraphStore } from "@/app/(platform)/build/stores/graphStore";
 import { useNodeStore } from "@/app/(platform)/build/stores/nodeStore";
-import { Label } from "@/components/__legacy__/ui/label";
-import { ScrollArea } from "@/components/__legacy__/ui/scroll-area";
+import { ScrollArea } from "@/components/molecules/ScrollArea/ScrollArea";
 import {
   Sheet,
   SheetContent,
@@ -10,7 +10,7 @@ import {
   SheetHeader,
   SheetTitle,
   SheetTrigger,
-} from "@/components/__legacy__/ui/sheet";
+} from "@/components/molecules/Dialog/components/SheetPrimitives";
 import { Button } from "@/components/atoms/Button/Button";
 import {
   Tooltip,
@@ -23,9 +23,11 @@ import {
   OutputActions,
   OutputItem,
 } from "@/components/contextual/OutputRenderers";
-import { BookOpenIcon } from "@phosphor-icons/react";
 import { useMemo } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { BookOpen01Icon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import { Text } from "@/components/atoms/Text/Text";
 
 export const AgentOutputs = ({ flowID }: { flowID: string | null }) => {
   const hasOutputs = useGraphStore(useShallow((state) => state.hasOutputs));
@@ -38,36 +40,51 @@ export const AgentOutputs = ({ flowID }: { flowID: string | null }) => {
 
     return outputNodes
       .map((node) => {
-        const executionResult = node.data.nodeExecutionResult;
-        const outputData = executionResult?.output_data?.output;
+        const executionResults = node.data.nodeExecutionResults || [];
 
-        const renderer = globalRegistry.getRenderer(outputData);
+        const items = executionResults
+          .filter((result) => result.output_data?.output !== undefined)
+          .map((result) => {
+            const outputData = result.output_data!.output;
+            const renderer = globalRegistry.getRenderer(outputData);
+            return {
+              nodeExecID: result.node_exec_id,
+              value: outputData,
+              renderer,
+            };
+          })
+          .filter(
+            (
+              item,
+            ): item is typeof item & {
+              renderer: NonNullable<typeof item.renderer>;
+            } => item.renderer !== null,
+          );
+
+        if (items.length === 0) return null;
 
         return {
+          nodeID: node.id,
           metadata: {
             name: node.data.hardcodedValues?.name || "Output",
             description:
-              node.data.hardcodedValues?.description || "Output from the agent",
+              node.data.hardcodedValues?.description ||
+              "Output from the workflow",
           },
-          value: outputData ?? "No output yet",
-          renderer,
+          items,
         };
       })
-      .filter(
-        (
-          output,
-        ): output is typeof output & {
-          renderer: NonNullable<typeof output.renderer>;
-        } => output.renderer !== null,
-      );
+      .filter((group): group is NonNullable<typeof group> => group !== null);
   }, [nodes]);
 
   const actionItems = useMemo(() => {
-    return outputs.map((output) => ({
-      value: output.value,
-      metadata: {},
-      renderer: output.renderer,
-    }));
+    return outputs.flatMap((group) =>
+      group.items.map((item) => ({
+        value: item.value,
+        metadata: group.metadata,
+        renderer: item.renderer,
+      })),
+    );
   }, [outputs]);
 
   return (
@@ -82,12 +99,12 @@ export const AgentOutputs = ({ flowID }: { flowID: string | null }) => {
                 data-id="agent-outputs-button"
                 disabled={!flowID || !hasOutputs()}
               >
-                <BookOpenIcon className="size-4" />
+                <Icon icon={BookOpen01Icon} className="size-4" />
               </Button>
             </SheetTrigger>
           </TooltipTrigger>
           <TooltipContent>
-            <p>Agent Outputs</p>
+            <p>Workflow Outputs</p>
           </TooltipContent>
         </Tooltip>
       </TooltipProvider>
@@ -95,13 +112,31 @@ export const AgentOutputs = ({ flowID }: { flowID: string | null }) => {
         <SheetHeader className="px-2 py-2">
           <div className="flex items-center justify-between">
             <div>
-              <SheetTitle className="text-xl">Run Outputs</SheetTitle>
-              <SheetDescription className="mt-1 text-sm text-muted-foreground">
+              <SheetTitle>
+                <Text
+                  variant="lead-semibold"
+                  as="span"
+                  tone="inherit"
+                  className="block"
+                >
+                  Run Outputs
+                </Text>
+              </SheetTitle>
+              <SheetDescription className="mt-1 text-foreground-tertiary">
                 <span className="inline-flex items-center gap-1.5">
-                  <span className="rounded-md bg-yellow-100 px-2 py-0.5 text-xs font-medium text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400">
-                    Beta
+                  <span className="rounded-md bg-yellow/30 px-2 py-0.5 text-yellow-foreground">
+                    <Text
+                      variant="small-medium-tight"
+                      as="span"
+                      tone="inherit"
+                      className="block"
+                    >
+                      Beta
+                    </Text>
                   </span>
-                  <span>This feature is in beta and may contain bugs</span>
+                  <Text variant="body-tight" as="span" tone="inherit">
+                    This feature is in beta and may contain bugs
+                  </Text>
                 </span>
               </SheetDescription>
             </div>
@@ -112,28 +147,43 @@ export const AgentOutputs = ({ flowID }: { flowID: string | null }) => {
           <ScrollArea className="h-full overflow-auto pr-4">
             <div className="space-y-6">
               {outputs && outputs.length > 0 ? (
-                outputs.map((output, i) => (
-                  <div key={i} className="space-y-2">
+                outputs.map((group) => (
+                  <div key={group.nodeID} className="space-y-2">
                     <div>
-                      <Label className="text-base font-semibold">
-                        {output.metadata.name || "Unnamed Output"}
+                      <Label>
+                        <Text
+                          variant="large-semibold-tight"
+                          as="span"
+                          tone="inherit"
+                        >
+                          {group.metadata.name || "Unnamed Output"}
+                        </Text>
                       </Label>
-                      {output.metadata.description && (
-                        <Label className="mt-1 block text-sm text-gray-600">
-                          {output.metadata.description}
+                      {group.metadata.description && (
+                        <Label className="mt-1 block text-foreground-secondary">
+                          <Text
+                            variant="body-medium-tight"
+                            as="span"
+                            tone="inherit"
+                          >
+                            {group.metadata.description}
+                          </Text>
                         </Label>
                       )}
                     </div>
 
-                    <OutputItem
-                      value={output.value}
-                      metadata={{}}
-                      renderer={output.renderer}
-                    />
+                    {group.items.map((item) => (
+                      <OutputItem
+                        key={item.nodeExecID}
+                        value={item.value}
+                        metadata={group.metadata}
+                        renderer={item.renderer}
+                      />
+                    ))}
                   </div>
                 ))
               ) : (
-                <div className="flex h-full items-center justify-center text-gray-500">
+                <div className="flex h-full items-center justify-center text-foreground-tertiary">
                   <p>No output blocks available.</p>
                 </div>
               )}

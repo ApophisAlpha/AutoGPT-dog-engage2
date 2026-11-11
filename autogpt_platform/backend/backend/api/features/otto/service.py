@@ -5,8 +5,8 @@ from typing import Optional
 import aiohttp
 from fastapi import HTTPException
 
+from backend.blocks import get_block
 from backend.data import graph as graph_db
-from backend.data.block import get_block
 from backend.util.settings import Settings
 
 from .models import ApiResponse, ChatRequest, GraphData
@@ -32,6 +32,8 @@ class OttoService:
             )
             if not graph:
                 return None
+            if graph.user_id != user_id:
+                graph = graph.shared_copy()
 
             nodes_data = []
             for node in graph.nodes:

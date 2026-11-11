@@ -1,12 +1,15 @@
+import { Button } from "@/components/atoms/Button/Button";
+import { Skeleton } from "@/components/atoms/Skeleton/Skeleton";
 import Image from "next/image";
-import { PlayIcon } from "@radix-ui/react-icons";
-import { Button } from "@/components/__legacy__/ui/button";
-import {
-  getYouTubeVideoId,
-  isValidVideoFile,
-  isValidVideoUrl,
-} from "./helpers";
+import { isLocalStoreMediaUrl } from "@/lib/store-media";
+import { useEffect, useState } from "react";
+import { isValidVideoFile, isValidVideoUrl } from "./helpers";
 import { useAgentImageItem } from "./useAgentImageItem";
+import { ImageNotFound01Icon, PlayIcon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import { useImageFallback } from "@/hooks/useImageFallback";
+import { YouTubeEmbed } from "@/components/molecules/YouTubeEmbed/YouTubeEmbed";
+import { isYouTubeUrl } from "@/components/molecules/YouTubeEmbed/helpers";
 
 interface AgentImageItemProps {
   image: string;
@@ -16,38 +19,36 @@ interface AgentImageItemProps {
   handlePause: (index: number) => void;
 }
 
-export const AgentImageItem: React.FC<AgentImageItemProps> = ({
+export function AgentImageItem({
   image,
   index,
   playingVideoIndex,
   handlePlay,
   handlePause,
-}) => {
+}: AgentImageItemProps) {
   const { videoRef } = useAgentImageItem({ playingVideoIndex, index });
   const isVideoFile = isValidVideoFile(image);
+  const [imageLoaded, setImageLoaded] = useState(false);
+  const { showImage, handleImageError } = useImageFallback(image);
+
+  useEffect(() => {
+    setImageLoaded(false);
+  }, [image]);
 
   return (
     <div className="relative">
-      <div className="h-[15rem] overflow-hidden rounded-[26px] bg-[#a8a8a8] dark:bg-neutral-700 sm:h-[20rem] sm:w-full md:h-[25rem] lg:h-[30rem]">
+      <div className="h-[15rem] overflow-hidden rounded-xl border border-separator bg-foreground-subtle sm:h-[20rem] sm:w-full md:h-[25rem] lg:h-[30rem]">
         {isValidVideoUrl(image) ? (
-          getYouTubeVideoId(image) ? (
-            <iframe
-              width="100%"
-              height="100%"
-              src={`https://www.youtube.com/embed/${getYouTubeVideoId(image)}`}
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-              allowFullScreen
-              title="YouTube video player"
-            ></iframe>
+          isYouTubeUrl(image) ? (
+            <YouTubeEmbed url={image} />
           ) : (
             <div className="relative h-full w-full overflow-hidden">
               <video
                 ref={videoRef}
-                className="absolute inset-0 h-full w-full object-cover"
+                className="absolute inset-0 h-full w-full object-cover object-[center_25%]"
                 controls
                 preload="metadata"
                 poster={`${image}#t=0.1`}
-                style={{ objectPosition: "center 25%" }}
                 onPlay={() => handlePlay(index)}
                 onPause={() => handlePause(index)}
                 autoPlay={false}
@@ -60,33 +61,53 @@ export const AgentImageItem: React.FC<AgentImageItemProps> = ({
           )
         ) : (
           <div className="relative h-full w-full">
-            <Image
-              src={image}
-              alt="Image"
-              fill
-              sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
-              className="rounded-xl object-cover"
-            />
+            {showImage ? (
+              <>
+                {!imageLoaded && (
+                  <Skeleton className="absolute inset-0 rounded-xl" />
+                )}
+                <Image
+                  src={image}
+                  unoptimized={isLocalStoreMediaUrl(image)}
+                  alt="Image"
+                  fill
+                  sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
+                  className="rounded-xl object-cover"
+                  onLoad={() => setImageLoaded(true)}
+                  onError={handleImageError}
+                />
+              </>
+            ) : (
+              <div className="flex h-full w-full items-center justify-center rounded-xl bg-surface-hover text-foreground-subtle">
+                <Icon icon={ImageNotFound01Icon} className="h-10 w-10" />
+              </div>
+            )}
           </div>
         )}
       </div>
       {isVideoFile && playingVideoIndex !== index && (
         <div className="absolute bottom-2 left-2 sm:bottom-3 sm:left-3 md:bottom-4 md:left-4 lg:bottom-[1.25rem] lg:left-[1.25rem]">
           <Button
-            size="default"
+            variant="secondary"
+            size="large"
             onClick={() => {
               if (videoRef.current) {
                 videoRef.current.play();
               }
             }}
+            rightIcon={
+              <Icon
+                icon={PlayIcon}
+                size={20}
+                tone="base"
+                className="sm:h-6 sm:w-6 md:h-7 md:w-7"
+              />
+            }
           >
-            <span className="pr-1 text-sm font-medium leading-6 tracking-tight text-[#272727] dark:text-neutral-200 sm:pr-2 sm:text-base sm:leading-7 md:text-lg md:leading-8 lg:text-xl lg:leading-9">
-              Play demo
-            </span>
-            <PlayIcon className="h-5 w-5 text-black dark:text-neutral-200 sm:h-6 sm:w-6 md:h-7 md:w-7" />
+            Play demo
           </Button>
         </div>
       )}
     </div>
   );
-};
+}

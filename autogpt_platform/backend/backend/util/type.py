@@ -55,7 +55,16 @@ def __convert_dict(value: Any) -> dict:
 
 
 def __convert_tuple(value: Any) -> tuple:
-    if isinstance(value, (str, list, set)):
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                parsed = json.loads(value)
+                return tuple(parsed) if isinstance(parsed, list) else (value,)
+            except json.JSONDecodeError:
+                return (value,)
+        return (value,)
+    if isinstance(value, (list, set)):
         return tuple(value)
     elif isinstance(value, dict):
         return tuple(value.items())
@@ -68,7 +77,21 @@ def __convert_tuple(value: Any) -> tuple:
 
 
 def __convert_set(value: Any) -> set:
-    if isinstance(value, (str, list, tuple)):
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    try:
+                        return set(parsed)
+                    except TypeError:
+                        return {value}
+                return {value}
+            except json.JSONDecodeError:
+                return {value}
+        return {value}
+    if isinstance(value, (list, tuple)):
         return set(value)
     elif isinstance(value, dict):
         return set(value.items())
@@ -94,6 +117,11 @@ def __convert_num(value: Any, num_type: Type[NUM]) -> NUM:
     elif isinstance(value, num_type):
         return value
     else:
+        if num_type is int and isinstance(value, str):
+            try:
+                return num_type(value)
+            except ValueError:
+                pass
         try:
             return num_type(float(value))
         except (ValueError, TypeError):
@@ -104,7 +132,7 @@ def __convert_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     elif isinstance(value, str):
-        if value.lower() in ["true", "1"]:
+        if value.strip().lower() in ["true", "1"]:
             return True
         else:
             return False
@@ -247,6 +275,112 @@ def convert(value: Any, target_type: Any) -> Any:
         return _try_convert(value, target_type, raise_on_mismatch=False)
     except Exception as e:
         raise ConversionError(f"Failed to convert {value} to {target_type}") from e
+
+
+def _value_satisfies_type(value: Any, target: Any) -> bool:
+    """Check whether *value* already satisfies *target*, including inner elements.
+
+    For union types this checks each member; for generic container types it
+    recursively checks that inner elements satisfy the type args (e.g. every
+    element in a ``list[str]`` is a ``str``).  Returns ``False`` when uncertain
+    so the caller falls through to :func:`convert`.
+    """
+    # typing.Any cannot be used with isinstance(); treat as always satisfied.
+    if target is Any:
+        return True
+
+    origin = get_origin(target)
+
+    if origin is Union or origin is types.UnionType:
+        non_none = [a for a in get_args(target) if a is not type(None)]
+        return any(_value_satisfies_type(value, member) for member in non_none)
+
+    # Generic container type (e.g. list[str], dict[str, int])
+    if origin is not None:
+        # Guard: origin may not be a runtime type (e.g. Literal)
+        if not isinstance(origin, type):
+            return False
+        if not isinstance(value, origin):
+            return False
+        args = get_args(target)
+        if not args:
+            return True
+        # Check inner elements satisfy the type args
+        if _is_type_or_subclass(origin, list):
+            return all(_value_satisfies_type(v, args[0]) for v in value)
+        if _is_type_or_subclass(origin, dict) and len(args) >= 2:
+            return all(
+                _value_satisfies_type(k, args[0]) and _value_satisfies_type(v, args[1])
+                for k, v in value.items()
+            )
+        if (
+            _is_type_or_subclass(origin, set) or _is_type_or_subclass(origin, frozenset)
+        ) and args:
+            return all(_value_satisfies_type(v, args[0]) for v in value)
+        if _is_type_or_subclass(origin, tuple):
+            # Homogeneous tuple[T, ...] — single type + Ellipsis
+            if len(args) == 2 and args[1] is Ellipsis:
+                return all(_value_satisfies_type(v, args[0]) for v in value)
+            # Heterogeneous tuple[T1, T2, ...] — positional types
+            if len(value) != len(args):
+                return False
+            return all(_value_satisfies_type(v, t) for v, t in zip(value, args))
+        # Unhandled generic origin — fall through to convert()
+        return False
+
+    # Simple type (e.g. str, int)
+    if isinstance(target, type):
+        try:
+            return isinstance(value, target)
+        except TypeError:
+            # TypedDict and some typing constructs don't support isinstance checks.
+            # For TypedDict, check if value is a dict with the required keys.
+            if isinstance(value, dict) and hasattr(target, "__required_keys__"):
+                return all(k in value for k in target.__required_keys__)
+            return False
+
+    return False
+
+
+def coerce_inputs_to_schema(data: dict[str, Any], schema: type) -> None:
+    """Coerce *data* values in-place to match *schema*'s field types.
+
+    Uses ``model_fields`` (not ``__annotations__``) so inherited fields are
+    included.  Skips coercion when the value already satisfies the target
+    type — in particular for union-typed fields where the value matches one
+    member but differs from the annotation object itself.
+
+    This is the single authoritative coercion step shared by the executor
+    (``validate_exec``) and the CoPilot (``execute_block``).
+
+    A value that can't be converted is left as it is, and the first such
+    error is raised once every other field has been coerced.
+    """
+    first_error: ConversionError | None = None
+    for name, field_info in schema.model_fields.items():
+        value = data.get(name)
+        if value is None:
+            continue
+        target = field_info.annotation
+        if target is None:
+            continue
+        if _value_satisfies_type(value, target):
+            continue
+        try:
+            data[name] = convert(value, target)
+        except ConversionError as e:
+            shown = repr(value)
+            if len(shown) > 100:
+                shown = shown[:100] + "..."
+            target_name = getattr(target, "__name__", str(target))
+            if first_error is None:
+                first_error = ConversionError(
+                    f"Input `{name}` can't take the value {shown}: "
+                    f"it can't be converted to {target_name}"
+                )
+                first_error.__cause__ = e
+    if first_error is not None:
+        raise first_error
 
 
 class FormattedStringType(str):

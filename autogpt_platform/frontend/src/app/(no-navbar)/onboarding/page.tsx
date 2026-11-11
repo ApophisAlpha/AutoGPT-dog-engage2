@@ -1,72 +1,177 @@
 "use client";
-import { LoadingSpinner } from "@/components/atoms/LoadingSpinner/LoadingSpinner";
-import { useRouter } from "next/navigation";
-import { useEffect } from "react";
-import { resolveResponse, shouldShowOnboarding } from "@/app/api/helpers";
-import { getV1OnboardingState } from "@/app/api/__generated__/endpoints/onboarding/onboarding";
+import { Button } from "@/components/atoms/Button/Button";
+import { Text } from "@/components/atoms/Text/Text";
+import { ErrorCard } from "@/components/molecules/ErrorCard/ErrorCard";
+import { cn } from "@/lib/utils";
+import { ArrowLeft01Icon, Logout03Icon } from "@hugeicons/core-free-icons";
+import { ProgressBar } from "./components/ProgressBar";
+import { ProgressError } from "./components/ProgressError";
+import { StepIndicator } from "./components/StepIndicator";
+import { orderedSteps } from "./progress";
+import { AccessStep } from "./steps/AccessStep/AccessStep";
+import { BrainDumpStep } from "./steps/BrainDumpStep/BrainDumpStep";
+import { ConnectStep } from "./steps/ConnectStep/ConnectStep";
+import { IntroStep } from "./steps/IntroStep/IntroStep";
+import { PreparingStep } from "./steps/PreparingStep";
+import { RoleStep } from "./steps/RoleStep";
+import { PlanTrialStep } from "./steps/SubscriptionStep/PlanTrialStep";
+import { useOnboardingWizardStore } from "./store";
+import { useOnboardingPage } from "./useOnboardingPage";
 
 export default function OnboardingPage() {
-  const router = useRouter();
+  const {
+    currentStep,
+    isLoading,
+    handlePreparingComplete,
+    isPaymentEnabled,
+    isSelfHostConnectEnabled,
+    canHireTeam,
+    steps,
+    preparingStep,
+    totalSteps,
+    trialConfirmation,
+    paidConfirmation,
+    progressError,
+    progressConflict,
+    retryProgress,
+    completionError,
+  } = useOnboardingPage();
+  const prevStep = useOnboardingWizardStore((s) => s.prevStep);
+  const isStepBusy = useOnboardingWizardStore((s) => s.isStepBusy);
 
-  useEffect(() => {
-    async function redirectToStep() {
-      try {
-        // Check if onboarding is enabled
-        const isEnabled = await shouldShowOnboarding();
-        if (!isEnabled) {
-          router.replace("/");
-          return;
-        }
+  if (isLoading && paidConfirmation.error)
+    return (
+      <ErrorCard
+        context="your payment"
+        responseError={{ message: paidConfirmation.error }}
+        onRetry={paidConfirmation.retry}
+      />
+    );
+  if (isLoading && paidConfirmation.pending)
+    return (
+      <Text variant="body" role="status">
+        Confirming your subscription…
+      </Text>
+    );
+  if (isLoading)
+    return !trialConfirmation.ready ? (
+      <Text variant="body" role="status">
+        Confirming your trial and card setup…
+      </Text>
+    ) : progressError ? (
+      <ProgressError
+        message={progressError}
+        conflict={progressConflict}
+        retry={retryProgress}
+      />
+    ) : (
+      <Text variant="body" role="status">
+        Loading your setup…
+      </Text>
+    );
 
-        const onboarding = await resolveResponse(getV1OnboardingState());
+  // ProgressBar + StepIndicator track only the user-interactive steps.
+  // PreparingStep is a transition view that hides both indicators.
+  const showDots = currentStep <= totalSteps;
+  // Back is hidden on the first content step
+  // and while the current step is mid-flight (brain dump processing) — there
+  // is nothing coherent to go back to. Read from the layout so it tracks
+  // buildStepLayout rather than a hardcoded position.
+  const firstContentStep = steps[orderedSteps(steps)[0]]!;
+  const showBack =
+    currentStep > firstContentStep && currentStep <= totalSteps && !isStepBusy;
+  const showProgressBar = currentStep <= totalSteps;
+  const showLogout = currentStep <= totalSteps;
 
-        // Handle completed onboarding
-        if (onboarding.completedSteps.includes("GET_RESULTS")) {
-          router.replace("/");
-          return;
-        }
+  return (
+    <div className="flex min-h-screen w-full flex-col items-center">
+      {progressError && (
+        <ProgressError
+          message={progressError}
+          conflict={progressConflict}
+          retry={retryProgress}
+        />
+      )}
+      {completionError && (
+        <ErrorCard
+          context="your account setup"
+          responseError={{ message: completionError }}
+          onRetry={handlePreparingComplete}
+        />
+      )}
+      {trialConfirmation.error ? (
+        <ErrorCard
+          context="your trial"
+          responseError={{ message: trialConfirmation.error }}
+          onRetry={trialConfirmation.retry}
+        />
+      ) : null}
+      {showProgressBar && (
+        <ProgressBar currentStep={currentStep} totalSteps={totalSteps} />
+      )}
 
-        // Redirect to appropriate step based on completed steps
-        if (onboarding.completedSteps.includes("AGENT_INPUT")) {
-          router.push("/onboarding/5-run");
-          return;
-        }
+      {showBack && (
+        <Button
+          type="button"
+          variant="toggle"
+          size="xs"
+          onClick={prevStep}
+          leadingIcon={ArrowLeft01Icon}
+          className="absolute top-6 left-6"
+        >
+          Back
+        </Button>
+      )}
 
-        if (onboarding.completedSteps.includes("AGENT_NEW_RUN")) {
-          router.push("/onboarding/5-run");
-          return;
-        }
+      <div
+        className={cn(
+          "flex w-full min-w-0 flex-1 items-center justify-center",
+          currentStep === steps.subscription
+            ? "pt-3 pb-8 lg:pb-2"
+            : "pt-16 pb-8",
+        )}
+      >
+        {currentStep === steps.access && <AccessStep />}
+        {currentStep === steps.team && <IntroStep slide="team" />}
+        {currentStep === steps.autopilot && <IntroStep slide="autopilot" />}
+        {currentStep === steps.role && <RoleStep />}
+        {currentStep === steps.painPoints && <BrainDumpStep />}
+        {isSelfHostConnectEnabled && currentStep === steps.connect && (
+          <ConnectStep />
+        )}
+        {currentStep === steps.subscription && (
+          <PlanTrialStep hasPaywall={isPaymentEnabled} />
+        )}
+        {currentStep === preparingStep && (
+          <PreparingStep
+            onComplete={handlePreparingComplete}
+            canHire={canHireTeam}
+          />
+        )}
+      </div>
 
-        if (onboarding.completedSteps.includes("AGENT_CHOICE")) {
-          router.push("/onboarding/5-run");
-          return;
-        }
+      {showDots && (
+        <div
+          className={
+            currentStep === steps.subscription ? "pb-8 lg:pb-4" : "pb-8"
+          }
+        >
+          <StepIndicator totalSteps={totalSteps} currentStep={currentStep} />
+        </div>
+      )}
 
-        if (onboarding.completedSteps.includes("INTEGRATIONS")) {
-          router.push("/onboarding/4-agent");
-          return;
-        }
-
-        if (onboarding.completedSteps.includes("USAGE_REASON")) {
-          router.push("/onboarding/3-services");
-          return;
-        }
-
-        if (onboarding.completedSteps.includes("WELCOME")) {
-          router.push("/onboarding/2-reason");
-          return;
-        }
-
-        // Default: redirect to first step
-        router.push("/onboarding/1-welcome");
-      } catch (error) {
-        console.error("Failed to determine onboarding step:", error);
-        router.replace("/");
-      }
-    }
-
-    redirectToStep();
-  }, [router]);
-
-  return <LoadingSpinner size="large" cover />;
+      {showLogout && (
+        <Button
+          as="NextLink"
+          href="/logout"
+          variant="toggle"
+          size="xs"
+          leadingIcon={Logout03Icon}
+          className="absolute bottom-6 left-6"
+        >
+          Log out
+        </Button>
+      )}
+    </div>
+  );
 }

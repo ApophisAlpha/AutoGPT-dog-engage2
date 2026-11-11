@@ -1,16 +1,18 @@
 from datetime import datetime, timedelta
 
-from backend.blocks.hubspot._auth import (
-    HubSpotCredentials,
-    HubSpotCredentialsField,
-    HubSpotCredentialsInput,
-)
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
+)
+from backend.blocks.hubspot._auth import (
+    CONTACT_SCOPES,
+    HubSpotCredentials,
+    HubSpotCredentialsField,
+    HubSpotCredentialsInput,
 )
 from backend.data.model import SchemaField
 from backend.util.request import Requests
@@ -18,7 +20,7 @@ from backend.util.request import Requests
 
 class HubSpotEngagementBlock(Block):
     class Input(BlockSchemaInput):
-        credentials: HubSpotCredentialsInput = HubSpotCredentialsField()
+        credentials: HubSpotCredentialsInput = HubSpotCredentialsField(CONTACT_SCOPES)
         operation: str = SchemaField(
             description="Operation to perform (send_email, track_engagement)",
             default="send_email",
@@ -46,6 +48,8 @@ class HubSpotEngagementBlock(Block):
             categories={BlockCategory.CRM, BlockCategory.COMMUNICATION},
             input_schema=HubSpotEngagementBlock.Input,
             output_schema=HubSpotEngagementBlock.Output,
+            is_irreversible_action=True,
+            effect=BlockEffect.EXTERNAL,
         )
 
     async def run(
@@ -53,7 +57,7 @@ class HubSpotEngagementBlock(Block):
     ) -> BlockOutput:
         base_url = "https://api.hubapi.com"
         headers = {
-            "Authorization": f"Bearer {credentials.api_key.get_secret_value()}",
+            "Authorization": credentials.auth_header(),
             "Content-Type": "application/json",
         }
 

@@ -1,8 +1,10 @@
+import { toastIfPlanRequired } from "@/components/contextual/PaywallToast/helpers";
 import { useEffect, useCallback, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useToast } from "@/components/molecules/Toast/use-toast";
-import { useBackendAPI } from "@/lib/autogpt-server-api/context";
+import { postV2CreateStoreSubmission } from "@/app/api/__generated__/endpoints/store/store";
+import { okData } from "@/app/api/helpers";
 import * as Sentry from "@sentry/nextjs";
 import {
   PublishAgentFormData,
@@ -32,7 +34,6 @@ export function useAgentInfoStep({
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const { toast } = useToast();
-  const api = useBackendAPI();
 
   const form = useForm<PublishAgentFormData>({
     resolver: zodResolver(publishAgentSchemaFactory(isMarketplaceUpdate)),
@@ -85,9 +86,15 @@ export function useAgentInfoStep({
     }
   }, [selectedAgentId, agentId]);
 
-  const handleImagesChange = useCallback((newImages: string[]) => {
-    setImages(newImages);
-  }, []);
+  const handleImagesChange = useCallback(
+    (newImages: string[]) => {
+      setImages(newImages);
+      if (newImages.length > 0) {
+        form.clearErrors("root");
+      }
+    },
+    [form],
+  );
 
   async function handleFormSubmit(data: PublishAgentFormData) {
     // Validate that at least one image is present
@@ -102,43 +109,45 @@ export function useAgentInfoStep({
     // Validate that an agent is selected before submission
     if (!selectedAgentId || !selectedAgentVersion) {
       toast({
-        title: "Agent Selection Required",
-        description: "Please select an agent before submitting to the store.",
+        title: "Workflow Selection Required",
+        description: "Please select a workflow before submitting to the store.",
         variant: "destructive",
       });
       return;
     }
 
-    const categories = data.category ? [data.category] : [];
-    const filteredCategories = categories.filter(Boolean);
+    const filteredCategories = [data.category].filter(Boolean);
 
     setIsSubmitting(true);
 
     try {
-      const response = await api.createStoreSubmission({
-        name: data.title,
-        sub_heading: data.subheader,
-        description: data.description,
-        instructions: data.instructions || null,
-        image_urls: images,
-        video_url: data.youtubeLink || "",
-        agent_output_demo_url: data.agentOutputDemo || "",
-        agent_id: selectedAgentId,
-        agent_version: selectedAgentVersion,
-        slug: (data.slug || "").replace(/\s+/g, "-"),
-        categories: filteredCategories,
-        recommended_schedule_cron: data.recommendedScheduleCron || null,
-        changes_summary: data.changesSummary || null,
-      } as any);
+      const response = okData(
+        await postV2CreateStoreSubmission({
+          slug: (data.slug || "").replace(/\s+/g, "-"),
+          graph_id: selectedAgentId,
+          graph_version: selectedAgentVersion,
+          name: data.title || "",
+          sub_heading: data.subheader || "",
+          description: data.description,
+          instructions: data.instructions || undefined,
+          categories: filteredCategories,
+          image_urls: images,
+          video_url: data.youtubeLink || undefined,
+          agent_output_demo_url: data.agentOutputDemo || undefined,
+          recommended_schedule_cron: data.recommendedScheduleCron || undefined,
+          changes_summary: data.changesSummary || undefined,
+        }),
+      );
 
       onSuccess(response);
     } catch (error) {
+      if (toastIfPlanRequired(error, "Publishing needs an active plan")) return;
       Sentry.captureException(error);
       toast({
-        title: "Submit Agent Error",
+        title: "Submit Workflow Error",
         description:
           (error instanceof Error ? error.message : undefined) ||
-          "An error occurred while submitting the agent. Please try again.",
+          "An error occurred while submitting the workflow. Please try again.",
         duration: 3000,
         variant: "destructive",
       });

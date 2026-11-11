@@ -1,15 +1,19 @@
 import { create } from "zustand";
+import isEqual from "lodash/isEqual";
 import { NodeChange, XYPosition, applyNodeChanges } from "@xyflow/react";
 import { CustomNode } from "../components/FlowEditor/nodes/CustomNode/CustomNode";
 import { CustomEdge } from "../components/FlowEditor/edges/CustomEdge";
 import { BlockInfo } from "@/app/api/__generated__/models/blockInfo";
+import { convertBlockInfoIntoCustomNodeData } from "../components/helper";
 import {
-  convertBlockInfoIntoCustomNodeData,
   findFreePosition,
-} from "../components/helper";
+  getBlockPlacementDimensions,
+} from "../components/placementHelpers";
 import { Node } from "@/app/api/__generated__/models/node";
 import { AgentExecutionStatus } from "@/app/api/__generated__/models/agentExecutionStatus";
 import { NodeExecutionResult } from "@/app/api/__generated__/models/nodeExecutionResult";
+import { NodeExecutionResultInputData } from "@/app/api/__generated__/models/nodeExecutionResultInputData";
+import { NodeExecutionResultOutputData } from "@/app/api/__generated__/models/nodeExecutionResultOutputData";
 import { useHistoryStore } from "./historyStore";
 import { useEdgeStore } from "./edgeStore";
 import { BlockUIType } from "../components/types";
@@ -18,31 +22,11 @@ import {
   ensurePathExists,
   parseHandleIdToPath,
 } from "@/components/renderers/InputRenderer/helpers";
-import { IncompatibilityInfo } from "../hooks/useSubAgentUpdate/types";
+import { accumulateExecutionData } from "./helpers";
+import { reuseUnchanged } from "@/lib/reuseUnchanged";
+import { NodeResolutionData } from "./types";
 
-// Resolution mode data stored per node
-export type NodeResolutionData = {
-  incompatibilities: IncompatibilityInfo;
-  // The NEW schema from the update (what we're updating TO)
-  pendingUpdate: {
-    input_schema: Record<string, unknown>;
-    output_schema: Record<string, unknown>;
-  };
-  // The OLD schema before the update (what we're updating FROM)
-  // Needed to merge and show removed inputs during resolution
-  currentSchema: {
-    input_schema: Record<string, unknown>;
-    output_schema: Record<string, unknown>;
-  };
-  // The full updated hardcoded values to apply when resolution completes
-  pendingHardcodedValues: Record<string, unknown>;
-};
-
-// Minimum movement (in pixels) required before logging position change to history
-// Prevents spamming history with small movements when clicking on inputs inside blocks
 const MINIMUM_MOVE_BEFORE_LOG = 50;
-
-// Track initial positions when drag starts (outside store to avoid re-renders)
 const dragStartPositions: Record<string, XYPosition> = {};
 
 let dragStartState: { nodes: CustomNode[]; edges: CustomEdge[] } | null = null;
@@ -52,6 +36,15 @@ type NodeStore = {
   nodeCounter: number;
   setNodeCounter: (nodeCounter: number) => void;
   nodeAdvancedStates: Record<string, boolean>;
+
+  latestNodeInputData: Record<string, NodeExecutionResultInputData | undefined>;
+  latestNodeOutputData: Record<
+    string,
+    NodeExecutionResultOutputData | undefined
+  >;
+  accumulatedNodeInputData: Record<string, Record<string, unknown[]>>;
+  accumulatedNodeOutputData: Record<string, Record<string, unknown[]>>;
+
   setNodes: (nodes: CustomNode[]) => void;
   onNodesChange: (changes: NodeChange<CustomNode>[]) => void;
   addNode: (node: CustomNode) => void;
@@ -72,12 +65,30 @@ type NodeStore = {
 
   updateNodeStatus: (nodeId: string, status: AgentExecutionStatus) => void;
   getNodeStatus: (nodeId: string) => AgentExecutionStatus | undefined;
+  cleanNodesStatuses: () => void;
 
   updateNodeExecutionResult: (
     nodeId: string,
     result: NodeExecutionResult,
   ) => void;
-  getNodeExecutionResult: (nodeId: string) => NodeExecutionResult | undefined;
+  applyNodeExecutionEvent: (
+    nodeId: string,
+    result: NodeExecutionResult,
+  ) => void;
+  getNodeExecutionResults: (nodeId: string) => NodeExecutionResult[];
+  getLatestNodeInputData: (
+    nodeId: string,
+  ) => NodeExecutionResultInputData | undefined;
+  getLatestNodeOutputData: (
+    nodeId: string,
+  ) => NodeExecutionResultOutputData | undefined;
+  getAccumulatedNodeInputData: (nodeId: string) => Record<string, unknown[]>;
+  getAccumulatedNodeOutputData: (nodeId: string) => Record<string, unknown[]>;
+  getLatestNodeExecutionResult: (
+    nodeId: string,
+  ) => NodeExecutionResult | undefined;
+  clearAllNodeExecutionResults: () => void;
+
   getNodeBlockUIType: (nodeId: string) => BlockUIType;
   hasWebhookNodes: () => boolean;
 
@@ -118,10 +129,18 @@ type NodeStore = {
 
 export const useNodeStore = create<NodeStore>((set, get) => ({
   nodes: [],
-  setNodes: (nodes) => set({ nodes }),
+  setNodes: (nodes) => {
+    // The caller may have changed the array it passes in since it was indexed.
+    nodeIndexes.delete(nodes);
+    set({ nodes });
+  },
   nodeCounter: 0,
   setNodeCounter: (nodeCounter) => set({ nodeCounter }),
   nodeAdvancedStates: {},
+  latestNodeInputData: {},
+  latestNodeOutputData: {},
+  accumulatedNodeInputData: {},
+  accumulatedNodeOutputData: {},
   incrementNodeCounter: () =>
     set((state) => ({
       nodeCounter: state.nodeCounter + 1,
@@ -214,21 +233,15 @@ export const useNodeStore = create<NodeStore>((set, get) => ({
     get().incrementNodeCounter();
     const nodeNumber = get().nodeCounter;
 
+    const dimensions = getBlockPlacementDimensions(block.uiType);
     const nodePosition =
       position ||
       findFreePosition(
-        get().nodes.map((node) => ({
-          position: node.position,
-          measured: {
-            width:
-              node.width ??
-              node.measured?.width ??
-              (node.data.uiType === BlockUIType.NOTE ? 300 : 500),
-            height: node.height ?? node.measured?.height ?? 400,
-          },
-        })),
-        block.uiType === BlockUIType.NOTE ? 300 : 400,
+        get().nodes,
+        dimensions.width,
         30,
+        undefined,
+        dimensions.height,
       );
 
     const customNode: CustomNode = {
@@ -250,6 +263,13 @@ export const useNodeStore = create<NodeStore>((set, get) => ({
       nodes: get().nodes,
       edges: useEdgeStore.getState().edges,
     };
+
+    // A write that changes nothing would still hand every subscriber a new
+    // nodes array and re-render the canvas, and could never add an undo entry.
+    const changesSomething = prevState.nodes.some(
+      (n) => n.id === nodeId && !hasNodeData(n.data, data),
+    );
+    if (!changesSomething) return;
 
     set((state) => ({
       nodes: state.nodes.map((n) =>
@@ -276,14 +296,15 @@ export const useNodeStore = create<NodeStore>((set, get) => ({
   getShowAdvanced: (nodeId: string) =>
     get().nodeAdvancedStates[nodeId] || false,
   addNodes: (nodes: CustomNode[]) => {
-    nodes.forEach((node) => {
-      get().addNode(node);
-    });
+    // One write for the whole batch: a write per node made every subscriber
+    // run once per node while a saved workflow loads.
+    if (nodes.length === 0) return;
+    set((state) => ({
+      nodes: [...state.nodes, ...nodes],
+    }));
   },
   getHardCodedValues: (nodeId: string) => {
-    return (
-      get().nodes.find((n) => n.id === nodeId)?.data?.hardcodedValues || {}
-    );
+    return findNodeById(get().nodes, nodeId)?.data?.hardcodedValues || {};
   },
   convertCustomNodeToBackendNode: (node: CustomNode) => {
     return {
@@ -307,27 +328,64 @@ export const useNodeStore = create<NodeStore>((set, get) => ({
     );
   },
   updateNodeStatus: (nodeId: string, status: AgentExecutionStatus) => {
-    set((state) => ({
-      nodes: state.nodes.map((n) =>
-        n.id === nodeId ? { ...n, data: { ...n.data, status } } : n,
-      ),
-    }));
+    set((state) => applyExecutionUpdate(state, nodeId, { status }));
   },
   getNodeStatus: (nodeId: string) => {
-    return get().nodes.find((n) => n.id === nodeId)?.data?.status;
+    return findNodeById(get().nodes, nodeId)?.data?.status;
+  },
+
+  cleanNodesStatuses: () => {
+    set((state) => ({
+      nodes: state.nodes.map((n) => ({
+        ...n,
+        data: { ...n.data, status: undefined },
+      })),
+    }));
   },
 
   updateNodeExecutionResult: (nodeId: string, result: NodeExecutionResult) => {
-    set((state) => ({
-      nodes: state.nodes.map((n) =>
-        n.id === nodeId
-          ? { ...n, data: { ...n.data, nodeExecutionResult: result } }
-          : n,
-      ),
-    }));
+    set((state) => applyExecutionUpdate(state, nodeId, { result }));
   },
-  getNodeExecutionResult: (nodeId: string) => {
-    return get().nodes.find((n) => n.id === nodeId)?.data?.nodeExecutionResult;
+  applyNodeExecutionEvent: (nodeId: string, result: NodeExecutionResult) => {
+    set((state) =>
+      applyExecutionUpdate(state, nodeId, { result, status: result.status }),
+    );
+    useEdgeStore.getState().updateEdgeBeads(nodeId, result);
+  },
+  getNodeExecutionResults: (nodeId: string) => {
+    return findNodeById(get().nodes, nodeId)?.data?.nodeExecutionResults || [];
+  },
+  getLatestNodeInputData: (nodeId: string) => {
+    return get().latestNodeInputData[nodeId];
+  },
+  getLatestNodeOutputData: (nodeId: string) => {
+    return get().latestNodeOutputData[nodeId];
+  },
+  getAccumulatedNodeInputData: (nodeId: string) => {
+    return get().accumulatedNodeInputData[nodeId] || {};
+  },
+  getAccumulatedNodeOutputData: (nodeId: string) => {
+    return get().accumulatedNodeOutputData[nodeId] || {};
+  },
+  getLatestNodeExecutionResult: (nodeId: string) => {
+    const results =
+      findNodeById(get().nodes, nodeId)?.data?.nodeExecutionResults || [];
+    return results.length > 0 ? results[results.length - 1] : undefined;
+  },
+  clearAllNodeExecutionResults: () => {
+    set((state) => ({
+      nodes: state.nodes.map((n) => ({
+        ...n,
+        data: {
+          ...n.data,
+          nodeExecutionResults: [],
+        },
+      })),
+      latestNodeInputData: {},
+      latestNodeOutputData: {},
+      accumulatedNodeInputData: {},
+      accumulatedNodeOutputData: {},
+    }));
   },
   getNodeBlockUIType: (nodeId: string) => {
     return (
@@ -358,7 +416,7 @@ export const useNodeStore = create<NodeStore>((set, get) => ({
   },
 
   getNodeErrors: (nodeId: string) => {
-    return get().nodes.find((n) => n.id === nodeId)?.data?.errors;
+    return findNodeById(get().nodes, nodeId)?.data?.errors;
   },
 
   setNodeErrorsForBackendId: (
@@ -536,3 +594,154 @@ export const useNodeStore = create<NodeStore>((set, get) => ({
     return mismatch?.newType;
   },
 }));
+
+/**
+ * Whether `data` already holds every value in `update`. A key the node does
+ * not have counts as a change even when its new value is `undefined`, because
+ * adding it still changes what the undo history compares.
+ */
+function hasNodeData(
+  data: CustomNode["data"],
+  update: Partial<CustomNode["data"]>,
+) {
+  return (Object.keys(update) as (keyof CustomNode["data"])[]).every(
+    (key) => Object.hasOwn(data, key) && isEqual(data[key], update[key]),
+  );
+}
+
+const nodeIndexes = new WeakMap<CustomNode[], Map<string, CustomNode>>();
+
+/**
+ * O(1) lookup by id. Every node subscribes with a by-id selector, so a `find`
+ * per selector costs O(nodes²) per store update; the index is built once per
+ * `nodes` array instead. Store writes always replace the array, never mutate
+ * it, and `setNodes` drops the index of the array it is given, so an index
+ * can never go stale. The first match wins, as with `find`.
+ */
+function findNodeById(nodes: CustomNode[], nodeId: string) {
+  let index = nodeIndexes.get(nodes);
+  if (!index) {
+    index = new Map();
+    for (const node of nodes) {
+      if (!index.has(node.id)) index.set(node.id, node);
+    }
+    nodeIndexes.set(nodes, index);
+  }
+  return index.get(nodeId);
+}
+
+/**
+ * Applies a status and/or an execution result to one node in a single write.
+ * Returns `state` itself when nothing changes, so subscribers are not notified.
+ */
+function applyExecutionUpdate(
+  state: NodeStore,
+  nodeId: string,
+  update: { result?: NodeExecutionResult; status?: AgentExecutionStatus },
+) {
+  const index = state.nodes.findIndex((n) => n.id === nodeId);
+  if (index === -1) return state;
+
+  const node = state.nodes[index];
+  const resultUpdate = update.result
+    ? withExecutionResult(state, node, update.result)
+    : null;
+  const statusChanged =
+    update.status !== undefined && update.status !== node.data.status;
+  if (!resultUpdate && !statusChanged) return state;
+
+  const { nodeExecutionResults, ...executionData } = resultUpdate ?? {};
+  const nodes = [...state.nodes];
+  nodes[index] = {
+    ...node,
+    data: {
+      ...node.data,
+      ...(nodeExecutionResults && { nodeExecutionResults }),
+      ...(statusChanged && { status: update.status }),
+    },
+  };
+  return { nodes, ...executionData };
+}
+
+/**
+ * The node's results and the store's latest and accumulated data once
+ * `result` is added, or null when the node already has an equal result.
+ */
+function withExecutionResult(
+  state: NodeStore,
+  node: CustomNode,
+  result: NodeExecutionResult,
+) {
+  const nodeId = node.id;
+  const existingResults = node.data.nodeExecutionResults || [];
+  const duplicateIndex = existingResults.findIndex(
+    (r) => r.node_exec_id === result.node_exec_id,
+  );
+
+  if (duplicateIndex === -1) {
+    return {
+      nodeExecutionResults: [...existingResults, result],
+      latestNodeInputData: {
+        ...state.latestNodeInputData,
+        [nodeId]: result.input_data,
+      },
+      latestNodeOutputData: {
+        ...state.latestNodeOutputData,
+        [nodeId]: result.output_data,
+      },
+      accumulatedNodeInputData: {
+        ...state.accumulatedNodeInputData,
+        [nodeId]: accumulateExecutionData(
+          state.accumulatedNodeInputData[nodeId] || {},
+          result.input_data,
+        ),
+      },
+      accumulatedNodeOutputData: {
+        ...state.accumulatedNodeOutputData,
+        [nodeId]: accumulateExecutionData(
+          state.accumulatedNodeOutputData[nodeId] || {},
+          result.output_data,
+        ),
+      },
+    };
+  }
+
+  const oldResult = existingResults[duplicateIndex];
+  const inputDataUnchanged =
+    reuseUnchanged(oldResult.input_data, result.input_data) ===
+    oldResult.input_data;
+  const outputDataUnchanged =
+    reuseUnchanged(oldResult.output_data, result.output_data) ===
+    oldResult.output_data;
+  if (inputDataUnchanged && outputDataUnchanged) return null;
+
+  const updatedResults = [...existingResults];
+  updatedResults[duplicateIndex] = result;
+  const mostRecentResult = updatedResults[updatedResults.length - 1];
+
+  return {
+    nodeExecutionResults: updatedResults,
+    latestNodeInputData: {
+      ...state.latestNodeInputData,
+      [nodeId]: mostRecentResult.input_data,
+    },
+    latestNodeOutputData: {
+      ...state.latestNodeOutputData,
+      [nodeId]: mostRecentResult.output_data,
+    },
+    accumulatedNodeInputData: {
+      ...state.accumulatedNodeInputData,
+      [nodeId]: updatedResults.reduce(
+        (acc, r) => accumulateExecutionData(acc, r.input_data),
+        {} as Record<string, unknown[]>,
+      ),
+    },
+    accumulatedNodeOutputData: {
+      ...state.accumulatedNodeOutputData,
+      [nodeId]: updatedResults.reduce(
+        (acc, r) => accumulateExecutionData(acc, r.output_data),
+        {} as Record<string, unknown[]>,
+      ),
+    },
+  };
+}

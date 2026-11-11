@@ -3,9 +3,10 @@ from typing import List, Literal
 
 from pydantic import SecretStr
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
@@ -134,6 +135,8 @@ class PublishToMediumBlock(Block):
                 }
             },
             test_credentials=TEST_CREDENTIALS,
+            is_irreversible_action=True,
+            effect=BlockEffect.EXTERNAL,
         )
 
     async def create_post(

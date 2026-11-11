@@ -6,13 +6,15 @@ from typing import Literal
 
 from pydantic import SecretStr
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
 )
+from backend.data.execution import ExecutionContext
 from backend.data.model import (
     APIKeyCredentials,
     CredentialsField,
@@ -21,7 +23,9 @@ from backend.data.model import (
 )
 from backend.integrations.providers import ProviderName
 from backend.util.exceptions import BlockExecutionError
+from backend.util.file import store_media_file
 from backend.util.request import Requests
+from backend.util.type import MediaFileType
 
 TEST_CREDENTIALS = APIKeyCredentials(
     id="01234567-89ab-cdef-0123-456789abcdef",
@@ -152,50 +156,8 @@ class VisualMediaType(str, Enum):
 logger = logging.getLogger(__name__)
 
 
-class AIShortformVideoCreatorBlock(Block):
-    """Creates a short‑form text‑to‑video clip using stock or AI imagery."""
-
-    class Input(BlockSchemaInput):
-        credentials: CredentialsMetaInput[
-            Literal[ProviderName.REVID], Literal["api_key"]
-        ] = CredentialsField(
-            description="The revid.ai integration can be used with "
-            "any API key with sufficient permissions for the blocks it is used on.",
-        )
-        script: str = SchemaField(
-            description="""1. Use short and punctuated sentences\n\n2. Use linebreaks to create a new clip\n\n3. Text outside of brackets is spoken by the AI, and [text between brackets] will be used to guide the visual generation. For example, [close-up of a cat] will show a close-up of a cat.""",
-            placeholder="[close-up of a cat] Meow!",
-        )
-        ratio: str = SchemaField(
-            description="Aspect ratio of the video", default="9 / 16"
-        )
-        resolution: str = SchemaField(
-            description="Resolution of the video", default="720p"
-        )
-        frame_rate: int = SchemaField(description="Frame rate of the video", default=60)
-        generation_preset: GenerationPreset = SchemaField(
-            description="Generation preset for visual style - only affects AI-generated visuals",
-            default=GenerationPreset.LEONARDO,
-            placeholder=GenerationPreset.LEONARDO,
-        )
-        background_music: AudioTrack = SchemaField(
-            description="Background music track",
-            default=AudioTrack.HIGHWAY_NOCTURNE,
-            placeholder=AudioTrack.HIGHWAY_NOCTURNE,
-        )
-        voice: Voice = SchemaField(
-            description="AI voice to use for narration",
-            default=Voice.LILY,
-            placeholder=Voice.LILY,
-        )
-        video_style: VisualMediaType = SchemaField(
-            description="Type of visual media to use for the video",
-            default=VisualMediaType.STOCK_VIDEOS,
-            placeholder=VisualMediaType.STOCK_VIDEOS,
-        )
-
-    class Output(BlockSchemaOutput):
-        video_url: str = SchemaField(description="The URL of the created video")
+class RevidVideoBlockBase(Block):
+    """Revid API calls shared by the video blocks; their `test_mock`s patch these by name."""
 
     async def create_webhook(self) -> tuple[str, str]:
         """Create a new webhook URL for receiving notifications."""
@@ -253,6 +215,52 @@ class AIShortformVideoCreatorBlock(Block):
             block_id=self.id,
         )
 
+
+class AIShortformVideoCreatorBlock(RevidVideoBlockBase):
+    """Creates a short‑form text‑to‑video clip using stock or AI imagery."""
+
+    class Input(BlockSchemaInput):
+        credentials: CredentialsMetaInput[
+            Literal[ProviderName.REVID], Literal["api_key"]
+        ] = CredentialsField(
+            description="The revid.ai integration can be used with "
+            "any API key with sufficient permissions for the blocks it is used on.",
+        )
+        script: str = SchemaField(
+            description="""1. Use short and punctuated sentences\n\n2. Use linebreaks to create a new clip\n\n3. Text outside of brackets is spoken by the AI, and [text between brackets] will be used to guide the visual generation. For example, [close-up of a cat] will show a close-up of a cat.""",
+            placeholder="[close-up of a cat] Meow!",
+        )
+        ratio: str = SchemaField(
+            description="Aspect ratio of the video", default="9 / 16"
+        )
+        resolution: str = SchemaField(
+            description="Resolution of the video", default="720p"
+        )
+        frame_rate: int = SchemaField(description="Frame rate of the video", default=60)
+        generation_preset: GenerationPreset = SchemaField(
+            description="Generation preset for visual style - only affects AI-generated visuals",
+            default=GenerationPreset.LEONARDO,
+            placeholder=GenerationPreset.LEONARDO,
+        )
+        background_music: AudioTrack = SchemaField(
+            description="Background music track",
+            default=AudioTrack.HIGHWAY_NOCTURNE,
+            placeholder=AudioTrack.HIGHWAY_NOCTURNE,
+        )
+        voice: Voice = SchemaField(
+            description="AI voice to use for narration",
+            default=Voice.LILY,
+            placeholder=Voice.LILY,
+        )
+        video_style: VisualMediaType = SchemaField(
+            description="Type of visual media to use for the video",
+            default=VisualMediaType.STOCK_VIDEOS,
+            placeholder=VisualMediaType.STOCK_VIDEOS,
+        )
+
+    class Output(BlockSchemaOutput):
+        video_url: str = SchemaField(description="The URL of the created video")
+
     def __init__(self):
         super().__init__(
             id="361697fb-0c4f-4feb-aed3-8320c88c771b",
@@ -271,7 +279,10 @@ class AIShortformVideoCreatorBlock(Block):
                 "voice": Voice.LILY,
                 "video_style": VisualMediaType.STOCK_VIDEOS,
             },
-            test_output=("video_url", "https://example.com/video.mp4"),
+            test_output=(
+                "video_url",
+                lambda x: x.startswith(("workspace://", "data:")),
+            ),
             test_mock={
                 "create_webhook": lambda *args, **kwargs: (
                     "test_uuid",
@@ -280,15 +291,22 @@ class AIShortformVideoCreatorBlock(Block):
                 "create_video": lambda *args, **kwargs: {"pid": "test_pid"},
                 "check_video_status": lambda *args, **kwargs: {
                     "status": "ready",
-                    "videoUrl": "https://example.com/video.mp4",
+                    "videoUrl": "data:video/mp4;base64,AAAA",
                 },
-                "wait_for_video": lambda *args, **kwargs: "https://example.com/video.mp4",
+                # Use data URI to avoid HTTP requests during tests
+                "wait_for_video": lambda *args, **kwargs: "data:video/mp4;base64,AAAA",
             },
             test_credentials=TEST_CREDENTIALS,
+            effect=BlockEffect.WORKSPACE,
         )
 
     async def run(
-        self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
+        self,
+        input_data: Input,
+        *,
+        credentials: APIKeyCredentials,
+        execution_context: ExecutionContext,
+        **kwargs,
     ) -> BlockOutput:
         # Create a new Webhook.site URL
         webhook_token, webhook_url = await self.create_webhook()
@@ -340,10 +358,16 @@ class AIShortformVideoCreatorBlock(Block):
             )
             video_url = await self.wait_for_video(credentials.api_key, pid)
             logger.debug(f"Video ready: {video_url}")
-            yield "video_url", video_url
+            # Store the generated video to the user's workspace for persistence
+            stored_url = await store_media_file(
+                file=MediaFileType(video_url),
+                execution_context=execution_context,
+                return_format="for_block_output",
+            )
+            yield "video_url", stored_url
 
 
-class AIAdMakerVideoCreatorBlock(Block):
+class AIAdMakerVideoCreatorBlock(RevidVideoBlockBase):
     """Generates a 30‑second vertical AI advert using optional user‑supplied imagery."""
 
     class Input(BlockSchemaInput):
@@ -377,62 +401,6 @@ class AIAdMakerVideoCreatorBlock(Block):
     class Output(BlockSchemaOutput):
         video_url: str = SchemaField(description="URL of the finished advert")
 
-    async def create_webhook(self) -> tuple[str, str]:
-        """Create a new webhook URL for receiving notifications."""
-        url = "https://webhook.site/token"
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        response = await Requests().post(url, headers=headers)
-        webhook_data = response.json()
-        return webhook_data["uuid"], f"https://webhook.site/{webhook_data['uuid']}"
-
-    async def create_video(self, api_key: SecretStr, payload: dict) -> dict:
-        """Create a video using the Revid API."""
-        url = "https://www.revid.ai/api/public/v2/render"
-        headers = {"key": api_key.get_secret_value()}
-        response = await Requests().post(url, json=payload, headers=headers)
-        logger.debug(
-            f"API Response Status Code: {response.status}, Content: {response.text}"
-        )
-        return response.json()
-
-    async def check_video_status(self, api_key: SecretStr, pid: str) -> dict:
-        """Check the status of a video creation job."""
-        url = f"https://www.revid.ai/api/public/v2/status?pid={pid}"
-        headers = {"key": api_key.get_secret_value()}
-        response = await Requests().get(url, headers=headers)
-        return response.json()
-
-    async def wait_for_video(
-        self,
-        api_key: SecretStr,
-        pid: str,
-        max_wait_time: int = 1000,
-    ) -> str:
-        """Wait for video creation to complete and return the video URL."""
-        start_time = time.time()
-        while time.time() - start_time < max_wait_time:
-            status = await self.check_video_status(api_key, pid)
-            logger.debug(f"Video status: {status}")
-
-            if status.get("status") == "ready" and "videoUrl" in status:
-                return status["videoUrl"]
-            elif status.get("status") == "error":
-                error_message = status.get("error", "Unknown error occurred")
-                logger.error(f"Video creation failed: {error_message}")
-                raise ValueError(f"Video creation failed: {error_message}")
-            elif status.get("status") in ["FAILED", "CANCELED"]:
-                logger.error(f"Video creation failed: {status.get('message')}")
-                raise ValueError(f"Video creation failed: {status.get('message')}")
-
-            await asyncio.sleep(10)
-
-        logger.error("Video creation timed out")
-        raise BlockExecutionError(
-            message="Video creation timed out",
-            block_name=self.name,
-            block_id=self.id,
-        )
-
     def __init__(self):
         super().__init__(
             id="58bd2a19-115d-4fd1-8ca4-13b9e37fa6a0",
@@ -447,7 +415,10 @@ class AIAdMakerVideoCreatorBlock(Block):
                     "https://cdn.revid.ai/uploads/1747076315114-image.png",
                 ],
             },
-            test_output=("video_url", "https://example.com/ad.mp4"),
+            test_output=(
+                "video_url",
+                lambda x: x.startswith(("workspace://", "data:")),
+            ),
             test_mock={
                 "create_webhook": lambda *args, **kwargs: (
                     "test_uuid",
@@ -456,14 +427,22 @@ class AIAdMakerVideoCreatorBlock(Block):
                 "create_video": lambda *args, **kwargs: {"pid": "test_pid"},
                 "check_video_status": lambda *args, **kwargs: {
                     "status": "ready",
-                    "videoUrl": "https://example.com/ad.mp4",
+                    "videoUrl": "data:video/mp4;base64,AAAA",
                 },
-                "wait_for_video": lambda *args, **kwargs: "https://example.com/ad.mp4",
+                "wait_for_video": lambda *args, **kwargs: "data:video/mp4;base64,AAAA",
             },
             test_credentials=TEST_CREDENTIALS,
+            effect=BlockEffect.WORKSPACE,
         )
 
-    async def run(self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs):
+    async def run(
+        self,
+        input_data: Input,
+        *,
+        credentials: APIKeyCredentials,
+        execution_context: ExecutionContext,
+        **kwargs,
+    ):
         webhook_token, webhook_url = await self.create_webhook()
 
         payload = {
@@ -531,10 +510,16 @@ class AIAdMakerVideoCreatorBlock(Block):
             raise RuntimeError("Failed to create video: No project ID returned")
 
         video_url = await self.wait_for_video(credentials.api_key, pid)
-        yield "video_url", video_url
+        # Store the generated video to the user's workspace for persistence
+        stored_url = await store_media_file(
+            file=MediaFileType(video_url),
+            execution_context=execution_context,
+            return_format="for_block_output",
+        )
+        yield "video_url", stored_url
 
 
-class AIScreenshotToVideoAdBlock(Block):
+class AIScreenshotToVideoAdBlock(RevidVideoBlockBase):
     """Creates an advert where the supplied screenshot is narrated by an AI avatar."""
 
     class Input(BlockSchemaInput):
@@ -558,62 +543,6 @@ class AIScreenshotToVideoAdBlock(Block):
     class Output(BlockSchemaOutput):
         video_url: str = SchemaField(description="Rendered video URL")
 
-    async def create_webhook(self) -> tuple[str, str]:
-        """Create a new webhook URL for receiving notifications."""
-        url = "https://webhook.site/token"
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        response = await Requests().post(url, headers=headers)
-        webhook_data = response.json()
-        return webhook_data["uuid"], f"https://webhook.site/{webhook_data['uuid']}"
-
-    async def create_video(self, api_key: SecretStr, payload: dict) -> dict:
-        """Create a video using the Revid API."""
-        url = "https://www.revid.ai/api/public/v2/render"
-        headers = {"key": api_key.get_secret_value()}
-        response = await Requests().post(url, json=payload, headers=headers)
-        logger.debug(
-            f"API Response Status Code: {response.status}, Content: {response.text}"
-        )
-        return response.json()
-
-    async def check_video_status(self, api_key: SecretStr, pid: str) -> dict:
-        """Check the status of a video creation job."""
-        url = f"https://www.revid.ai/api/public/v2/status?pid={pid}"
-        headers = {"key": api_key.get_secret_value()}
-        response = await Requests().get(url, headers=headers)
-        return response.json()
-
-    async def wait_for_video(
-        self,
-        api_key: SecretStr,
-        pid: str,
-        max_wait_time: int = 1000,
-    ) -> str:
-        """Wait for video creation to complete and return the video URL."""
-        start_time = time.time()
-        while time.time() - start_time < max_wait_time:
-            status = await self.check_video_status(api_key, pid)
-            logger.debug(f"Video status: {status}")
-
-            if status.get("status") == "ready" and "videoUrl" in status:
-                return status["videoUrl"]
-            elif status.get("status") == "error":
-                error_message = status.get("error", "Unknown error occurred")
-                logger.error(f"Video creation failed: {error_message}")
-                raise ValueError(f"Video creation failed: {error_message}")
-            elif status.get("status") in ["FAILED", "CANCELED"]:
-                logger.error(f"Video creation failed: {status.get('message')}")
-                raise ValueError(f"Video creation failed: {status.get('message')}")
-
-            await asyncio.sleep(10)
-
-        logger.error("Video creation timed out")
-        raise BlockExecutionError(
-            message="Video creation timed out",
-            block_name=self.name,
-            block_id=self.id,
-        )
-
     def __init__(self):
         super().__init__(
             id="0f3e4635-e810-43d9-9e81-49e6f4e83b7c",
@@ -626,7 +555,10 @@ class AIScreenshotToVideoAdBlock(Block):
                 "script": "Amazing numbers!",
                 "screenshot_url": "https://cdn.revid.ai/uploads/1747080376028-image.png",
             },
-            test_output=("video_url", "https://example.com/screenshot.mp4"),
+            test_output=(
+                "video_url",
+                lambda x: x.startswith(("workspace://", "data:")),
+            ),
             test_mock={
                 "create_webhook": lambda *args, **kwargs: (
                     "test_uuid",
@@ -635,14 +567,22 @@ class AIScreenshotToVideoAdBlock(Block):
                 "create_video": lambda *args, **kwargs: {"pid": "test_pid"},
                 "check_video_status": lambda *args, **kwargs: {
                     "status": "ready",
-                    "videoUrl": "https://example.com/screenshot.mp4",
+                    "videoUrl": "data:video/mp4;base64,AAAA",
                 },
-                "wait_for_video": lambda *args, **kwargs: "https://example.com/screenshot.mp4",
+                "wait_for_video": lambda *args, **kwargs: "data:video/mp4;base64,AAAA",
             },
             test_credentials=TEST_CREDENTIALS,
+            effect=BlockEffect.WORKSPACE,
         )
 
-    async def run(self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs):
+    async def run(
+        self,
+        input_data: Input,
+        *,
+        credentials: APIKeyCredentials,
+        execution_context: ExecutionContext,
+        **kwargs,
+    ):
         webhook_token, webhook_url = await self.create_webhook()
 
         payload = {
@@ -710,4 +650,10 @@ class AIScreenshotToVideoAdBlock(Block):
             raise RuntimeError("Failed to create video: No project ID returned")
 
         video_url = await self.wait_for_video(credentials.api_key, pid)
-        yield "video_url", video_url
+        # Store the generated video to the user's workspace for persistence
+        stored_url = await store_media_file(
+            file=MediaFileType(video_url),
+            execution_context=execution_context,
+            return_format="for_block_output",
+        )
+        yield "video_url", stored_url

@@ -1,44 +1,50 @@
 "use client";
-
-import { MagnifyingGlassIcon } from "@radix-ui/react-icons";
 import { useSearchbar } from "./useSearchBar";
+import { Search01Icon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
 
 interface SearchBarProps {
   placeholder?: string;
-  backgroundColor?: string;
-  iconColor?: string;
-  textColor?: string;
-  placeholderColor?: string;
   width?: string;
   height?: string;
+  defaultValue?: string;
+  onSubmit?: (query: string) => void;
 }
 
-export const SearchBar = ({
-  placeholder = 'Search for tasks like "optimise SEO"',
-  backgroundColor = "bg-neutral-100 dark:bg-neutral-800",
-  iconColor = "text-[#646464] dark:text-neutral-400",
-  textColor = "text-[#707070] dark:text-neutral-200",
-  placeholderColor = "text-[#707070] dark:text-neutral-400",
-  width = "w-9/10 lg:w-[56.25rem]",
-  height = "h-[60px]",
-}: SearchBarProps) => {
-  const { handleSubmit, setSearchQuery, searchQuery } = useSearchbar();
+export function SearchBar({
+  placeholder = 'Search for tasks like "optimize SEO"',
+  width = "w-full lg:w-[56.25rem]",
+  height = "h-[3.8rem]",
+  defaultValue,
+  onSubmit,
+}: SearchBarProps) {
+  const { handleSubmit, setSearchQuery, searchQuery } = useSearchbar({
+    defaultValue,
+    onSubmit,
+  });
 
   return (
     <form
       onSubmit={handleSubmit}
       data-testid="store-search-bar"
-      className={`${width} ${height} px-4 pt-2 md:px-6 md:pt-1 ${backgroundColor} flex items-center justify-center gap-2 rounded-full md:gap-5`}
+      className={`${width} ${height} flex items-center gap-3 rounded-full border border-border-base bg-surface px-4 shadow-none focus-within:border-foreground-subtle focus-within:ring-1 focus-within:ring-foreground-subtle focus-within:ring-offset-0`}
     >
-      <MagnifyingGlassIcon className={`h-5 w-5 md:h-7 md:w-7 ${iconColor}`} />
+      <Icon
+        icon={Search01Icon}
+        size={20}
+        tone="subtle"
+        className="md:h-6 md:w-6"
+        aria-hidden="true"
+      />
       <input
         type="text"
+        aria-label={placeholder}
         value={searchQuery}
         onChange={(e) => setSearchQuery(e.target.value)}
         placeholder={placeholder}
-        className={`flex-grow border-none bg-transparent ${textColor} font-sans text-lg font-normal leading-[2.25rem] tracking-tight md:text-xl placeholder:${placeholderColor} focus:outline-none`}
+        className="flex-grow border-none bg-transparent text-body-lg font-normal text-foreground-base placeholder:text-body-lg placeholder:font-normal placeholder:text-foreground-subtle focus:outline-none md:text-lead md:placeholder:text-lead"
         data-testid="store-search-input"
       />
     </form>
   );
-};
+}

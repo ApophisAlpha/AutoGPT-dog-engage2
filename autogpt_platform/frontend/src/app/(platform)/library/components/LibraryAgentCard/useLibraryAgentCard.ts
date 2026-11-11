@@ -1,32 +1,41 @@
 "use client";
 
-import { getQueryClient } from "@/lib/react-query/queryClient";
+import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { usePatchV2UpdateLibraryAgent } from "@/app/api/__generated__/endpoints/library/library";
+import {
+  getGetV2ListFavoriteLibraryAgentsQueryKey,
+  usePatchV2UpdateLibraryAgent,
+} from "@/app/api/__generated__/endpoints/library/library";
 import { useGetV2GetUserProfile } from "@/app/api/__generated__/endpoints/store/store";
 import { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
 import { okData } from "@/app/api/helpers";
 import { useToast } from "@/components/molecules/Toast/use-toast";
+import { isLogoutInProgress } from "@/lib/autogpt-server-api/helpers";
+import { useAuth } from "@/lib/auth/hooks/useAuth";
 import { updateFavoriteInQueries } from "./helpers";
 
 interface Props {
   agent: LibraryAgent;
+  onFavoriteAdd?: (position: { x: number; y: number }) => void;
 }
 
-export function useLibraryAgentCard({ agent }: Props) {
-  const { id, name, is_favorite, creator_image_url, marketplace_listing } =
-    agent;
+export function useLibraryAgentCard({ agent, onFavoriteAdd }: Props) {
+  const { id, is_favorite, creator_image_url, marketplace_listing } = agent;
 
   const isFromMarketplace = Boolean(marketplace_listing);
   const [isFavorite, setIsFavorite] = useState(is_favorite);
   const { toast } = useToast();
-  const queryClient = getQueryClient();
+  const queryClient = useQueryClient();
   const { mutateAsync: updateLibraryAgent } = usePatchV2UpdateLibraryAgent();
+  const { user, isLoggedIn } = useAuth();
+  const logoutInProgress = isLogoutInProgress();
 
   const { data: profile } = useGetV2GetUserProfile({
     query: {
       select: okData,
+      enabled: isLoggedIn && !!user && !logoutInProgress,
+      queryKey: ["/api/store/profile", user?.id],
     },
   });
 
@@ -43,26 +52,31 @@ export function useLibraryAgentCard({ agent }: Props) {
     });
   }
 
-  async function handleToggleFavorite(e: React.MouseEvent) {
+  async function handleToggleFavorite(
+    e: React.MouseEvent,
+    position: { x: number; y: number },
+  ) {
     e.preventDefault();
     e.stopPropagation();
 
     const newIsFavorite = !isFavorite;
 
+    // Optimistic update - update UI immediately
     setIsFavorite(newIsFavorite);
     updateQueryData(newIsFavorite);
+
+    // Trigger animation immediately for adding to favorites
+    if (newIsFavorite && onFavoriteAdd) {
+      onFavoriteAdd(position);
+    }
 
     try {
       await updateLibraryAgent({
         libraryAgentId: id,
         data: { is_favorite: newIsFavorite },
       });
-
-      toast({
-        title: newIsFavorite ? "Added to favorites" : "Removed from favorites",
-        description: `${name} has been ${newIsFavorite ? "added to" : "removed from"} your favorites.`,
-      });
     } catch {
+      // Revert on failure
       setIsFavorite(!newIsFavorite);
       updateQueryData(!newIsFavorite);
 
@@ -70,6 +84,10 @@ export function useLibraryAgentCard({ agent }: Props) {
         title: "Error",
         description: "Failed to update favorite status. Please try again.",
         variant: "destructive",
+      });
+    } finally {
+      queryClient.invalidateQueries({
+        queryKey: getGetV2ListFavoriteLibraryAgentsQueryKey(),
       });
     }
   }

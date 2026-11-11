@@ -1,15 +1,3 @@
-export enum SubmissionStatus {
-  DRAFT = "DRAFT",
-  PENDING = "PENDING",
-  APPROVED = "APPROVED",
-  REJECTED = "REJECTED",
-}
-export type ReviewSubmissionRequest = {
-  store_listing_version_id: string;
-  is_approved: boolean;
-  comments: string; // External comments visible to creator
-  internal_comments?: string; // Admin-only comments
-};
 export type Category = {
   category: string;
   description: string;
@@ -27,7 +15,7 @@ export type BlockCost = {
   cost_filter: Record<string, any>;
 };
 
-/* Mirror of backend/data/block.py:Block */
+/* Mirror of backend/blocks/_base.py:Block */
 export type Block = {
   id: string;
   name: string;
@@ -206,7 +194,24 @@ export type CredentialsType =
   | "api_key"
   | "oauth2"
   | "user_password"
-  | "host_scoped";
+  | "host_scoped"
+  | "device_code";
+
+/**
+ * Every credential type the platform can store, as a runtime list.
+ *
+ * Built from a total `Record<CredentialsType, true>` so that extending
+ * `CredentialsType` without updating this list fails the build. Use it
+ * wherever a list of credential types acts as a filter: an omission there
+ * silently removes a connection method rather than mis-ordering it.
+ */
+export const CREDENTIALS_TYPES: readonly CredentialsType[] = Object.keys({
+  api_key: true,
+  oauth2: true,
+  user_password: true,
+  host_scoped: true,
+  device_code: true,
+} satisfies Record<CredentialsType, true>) as CredentialsType[];
 
 export type Credentials =
   | APIKeyCredentials
@@ -232,7 +237,11 @@ export type BlockIOCredentialsSubSchema = BlockIOObjectSubSchema & {
   credentials_types: Array<CredentialsType>;
   discriminator?: string;
   discriminator_mapping?: Record<string, CredentialsProviderName>;
+  discriminator_type_mapping?: Record<string, CredentialsType[]>;
   discriminator_values?: any[];
+  credential_free_discriminator_values?: unknown[];
+  /* Set by the backend on blocks that can't run on the platform's shared keys */
+  refuses_platform_credentials?: boolean;
   secret?: boolean;
 };
 
@@ -292,7 +301,7 @@ export type NodeCreatable = {
 export type Node = NodeCreatable & {
   input_links: Link[];
   output_links: Link[];
-  webhook?: Webhook;
+  webhook_id?: string | null;
 };
 
 /* Mirror of backend/data/graph.py:Link */
@@ -362,25 +371,14 @@ export type GraphMeta = {
   user_id: UserID;
   version: number;
   is_active: boolean;
+  created_at: Date;
   name: string;
   description: string;
   instructions?: string | null;
   recommended_schedule_cron: string | null;
   forked_from_id?: GraphID | null;
   forked_from_version?: number | null;
-  input_schema: GraphInputSchema;
-  output_schema: GraphOutputSchema;
-  credentials_input_schema: CredentialsInputSchema;
-} & (
-  | {
-      has_external_trigger: true;
-      trigger_setup_info: GraphTriggerInfo;
-    }
-  | {
-      has_external_trigger: false;
-      trigger_setup_info: null;
-    }
-);
+};
 
 export type GraphID = Brand<string, "GraphID">;
 
@@ -447,10 +445,27 @@ export type GraphTriggerInfo = {
 
 /* Mirror of backend/data/graph.py:Graph */
 export type Graph = GraphMeta & {
-  created_at: Date;
   nodes: Node[];
   links: Link[];
   sub_graphs: Omit<Graph, "sub_graphs">[]; // Flattened sub-graphs
+  input_schema: GraphInputSchema;
+  output_schema: GraphOutputSchema;
+  credentials_input_schema: CredentialsInputSchema;
+} & (
+    | {
+        has_external_trigger: true;
+        trigger_setup_info: GraphTriggerInfo;
+      }
+    | {
+        has_external_trigger: false;
+        trigger_setup_info: null;
+      }
+  );
+
+export type SkippedWebhookPreset = {
+  id: string;
+  name: string;
+  pinned_version: number;
 };
 
 export type GraphUpdateable = Omit<
@@ -516,7 +531,7 @@ export type GraphValidationErrorResponse = {
 
 /* *** LIBRARY *** */
 
-/* Mirror of backend/server/v2/library/model.py:LibraryAgent */
+/* Mirror of backend/api/features/library/model.py:LibraryAgent */
 export type LibraryAgent = {
   id: LibraryAgentID;
   graph_id: GraphID;
@@ -612,11 +627,12 @@ export type LibraryAgentPresetUpdatable = Partial<
 export enum LibraryAgentSortEnum {
   CREATED_AT = "createdAt",
   UPDATED_AT = "updatedAt",
+  LAST_RUN = "lastRunAt",
 }
 
 /* *** CREDENTIALS *** */
 
-/* Mirror of backend/server/integrations/router.py:CredentialsMetaResponse */
+/* Mirror of backend/api/features/integrations/router.py:CredentialsMetaResponse */
 export type CredentialsMetaResponse = {
   id: string;
   provider: CredentialsProviderName;
@@ -625,16 +641,18 @@ export type CredentialsMetaResponse = {
   scopes?: Array<string>;
   username?: string;
   host?: string;
+  mcp_auth_scheme?: "basic" | "bearer" | null;
   is_system?: boolean;
+  is_managed?: boolean;
 };
 
-/* Mirror of backend/server/integrations/router.py:CredentialsDeletionResponse */
+/* Mirror of backend/api/features/integrations/router.py:CredentialsDeletionResponse */
 export type CredentialsDeleteResponse = {
   deleted: true;
   revoked: boolean | null;
 };
 
-/* Mirror of backend/server/integrations/router.py:CredentialsDeletionNeedsConfirmationResponse */
+/* Mirror of backend/api/features/integrations/router.py:CredentialsDeletionNeedsConfirmationResponse */
 export type CredentialsDeleteNeedConfirmationResponse = {
   deleted: false;
   need_confirmation: true;
@@ -682,6 +700,7 @@ export type UserPasswordCredentials = BaseCredentials & {
   title: string;
   username: string;
   password: string;
+  scope?: string;
 };
 
 /* Mirror of backend/backend/data/model.py:HostScopedCredentials */
@@ -694,28 +713,32 @@ export type HostScopedCredentials = BaseCredentials & {
 
 // Mirror of backend/backend/data/notifications.py:NotificationType
 export type NotificationType =
-  | "AGENT_RUN"
-  | "ZERO_BALANCE"
-  | "LOW_BALANCE"
-  | "BLOCK_EXECUTION_FAILED"
-  | "CONTINUOUS_AGENT_ERROR"
-  | "DAILY_SUMMARY"
-  | "WEEKLY_SUMMARY"
-  | "MONTHLY_SUMMARY"
-  | "AGENT_APPROVED"
-  | "AGENT_REJECTED";
+  | "BRIEFING"
+  | "ALERT"
+  | "VERDICT"
+  | "OPS"
+  | "SUBSCRIPTION_WELCOME"
+  | "PAYMENT_FAILED"
+  | "PAYMENT_FINAL_NOTICE"
+  | "SUBSCRIPTION_CANCELLED"
+  | "SUBSCRIPTION_RESUMED"
+  | "SUBSCRIPTION_ENDED";
 
-// Mirror of backend/backend/data/notifications.py:NotificationPreference
+export type BriefingFrequency = "DAILY" | "WEEKLY" | "MONTHLY" | "OFF";
+
+// Mirror of backend/backend/data/notifications.py:NotificationPreferenceDTO.
+// A volume knob rather than a checkbox list: billing and account messages are
+// service mail and are not represented here.
 export type NotificationPreferenceDTO = {
   email: string;
-  preferences: { [key in NotificationType]: boolean };
+  briefing_frequency: BriefingFrequency;
+  alerts_enabled: boolean;
+  store_verdicts_enabled: boolean;
   daily_limit: number;
 };
 
 export type NotificationPreference = NotificationPreferenceDTO & {
   user_id: UserID;
-  emails_sent_today: number;
-  last_reset_date: Date;
 };
 
 /* Mirror of backend/data/integrations.py:Webhook */
@@ -749,127 +772,21 @@ export enum BlockUIType {
   AGENT = "Agent",
   AI = "AI",
   AYRSHARE = "Ayrshare",
+  MCP_TOOL = "MCP Tool",
 }
 
 export enum SpecialBlockID {
   AGENT = "e189baac-8c20-45a1-94a7-55177ea42565",
-  SMART_DECISION = "3b191d9f-356f-482d-8238-ba04b6d18381",
+  MCP_TOOL = "a0a4b1c2-d3e4-4f56-a7b8-c9d0e1f2a3b4",
+  TOOL_ORCHESTRATOR = "3b191d9f-356f-482d-8238-ba04b6d18381",
   OUTPUT = "363ae599-353e-4804-937e-b2ee3cef3da4",
 }
-
-export type AnalyticsMetrics = {
-  metric_name: string;
-  metric_value: number;
-  data_string: string;
-};
-
-export type AnalyticsDetails = {
-  type: string;
-  data: Record<string, any>;
-  index: string;
-};
 
 export type Pagination = {
   total_items: number;
   total_pages: number;
   current_page: number;
   page_size: number;
-};
-
-export type StoreAgent = {
-  slug: string;
-  agent_name: string;
-  agent_image: string;
-  creator: string;
-  creator_avatar: string;
-  sub_heading: string;
-  description: string;
-  runs: number;
-  rating: number;
-  updated_at: string;
-};
-
-export type StoreAgentsResponse = {
-  agents: StoreAgent[];
-  pagination: Pagination;
-};
-
-export type Creator = {
-  name: string;
-  username: string;
-  description: string;
-  avatar_url: string;
-  num_agents: number;
-  agent_rating: number;
-  agent_runs: number;
-};
-
-export type CreatorsResponse = {
-  creators: Creator[];
-  pagination: Pagination;
-};
-
-export type CreatorDetails = {
-  name: string;
-  username: string;
-  description: string;
-  links: string[];
-  avatar_url: string;
-  agent_rating: number;
-  agent_runs: number;
-  top_categories: string[];
-};
-
-export type StoreSubmission = {
-  agent_id: string;
-  agent_version: number;
-  name: string;
-  sub_heading: string;
-  description: string;
-  instructions?: string;
-  image_urls: string[];
-  date_submitted: string;
-  status: SubmissionStatus;
-  runs: number;
-  rating: number;
-  slug: string;
-  store_listing_version_id?: string;
-  version?: number; // Actual version number from the database
-
-  // Review information
-  reviewer_id?: string;
-  review_comments?: string;
-  internal_comments?: string; // Admin-only comments
-  reviewed_at?: string;
-  changes_summary?: string;
-};
-
-export type StoreSubmissionsResponse = {
-  submissions: StoreSubmission[];
-  pagination: Pagination;
-};
-
-export type StoreSubmissionRequest = {
-  agent_id: string;
-  agent_version: number;
-  slug: string;
-  name: string;
-  sub_heading: string;
-  video_url?: string;
-  image_urls: string[];
-  description: string;
-  instructions?: string | null;
-  categories: string[];
-  changes_summary?: string;
-  recommended_schedule_cron?: string | null;
-};
-
-export type ProfileDetails = {
-  name: string;
-  username: string;
-  description: string;
-  links: string[];
-  avatar_url: string;
 };
 
 /* Mirror of backend/executor/scheduler.py:GraphExecutionJobInfo */
@@ -888,7 +805,7 @@ export type Schedule = {
 
 export type ScheduleID = Brand<string, "ScheduleID">;
 
-/* Mirror of backend/server/routers/v1.py:ScheduleCreationRequest */
+/* Mirror of backend/api/features/v1.py:ScheduleCreationRequest */
 export type ScheduleCreatable = {
   graph_id: GraphID;
   graph_version: number;
@@ -896,32 +813,6 @@ export type ScheduleCreatable = {
   cron: string;
   inputs: Record<string, any>;
   credentials?: Record<string, CredentialsMetaInput>;
-};
-
-export type MyAgent = {
-  agent_id: GraphID;
-  agent_version: number;
-  agent_name: string;
-  agent_image: string | null;
-  last_edited: string;
-  description: string;
-  recommended_schedule_cron: string | null;
-};
-
-export type MyAgentsResponse = {
-  agents: MyAgent[];
-  pagination: Pagination;
-};
-
-export type StoreReview = {
-  score: number;
-  comments?: string;
-};
-
-export type StoreReviewCreate = {
-  store_listing_version_id: string;
-  score: number;
-  comments?: string;
 };
 
 // API Key Types
@@ -962,7 +853,7 @@ export interface CreditTransaction {
   transaction_time: Date;
   transaction_type: CreditTransactionType;
   amount: number;
-  running_balance: number;
+  running_balance?: number;
   current_balance: number;
   description: string;
   usage_graph_id: GraphID;
@@ -1003,15 +894,16 @@ export type OnboardingStep =
   | "AGENT_INPUT"
   | "CONGRATS"
   // First Wins
+  | "ONBOARDING_COMPLETE"
   | "GET_RESULTS"
-  | "MARKETPLACE_VISIT"
+  | "MARKETPLACE_VISIT" // deprecated: never set
   | "MARKETPLACE_ADD_AGENT"
-  | "MARKETPLACE_RUN_AGENT"
-  | "BUILDER_SAVE_AGENT"
+  | "LIBRARY_RUN_AGENT"
+  | "BUILDER_SAVE_AGENT" // deprecated: never set
   // Consistency Challenge
-  | "RE_RUN_AGENT"
+  | "RE_RUN_AGENT" // deprecated: never set
   | "SCHEDULE_AGENT"
-  | "RUN_AGENTS"
+  | "RUN_AGENTS" // deprecated: never set
   | "RUN_3_DAYS"
   // The Pro Playground
   | "TRIGGER_WEBHOOK"
@@ -1019,13 +911,33 @@ export type OnboardingStep =
   | "RUN_AGENTS_100"
   // No longer used but tracked
   | "BUILDER_OPEN"
-  | "BUILDER_RUN_AGENT";
+  | "BUILDER_RUN_AGENT"
+  // Copilot home first-run: capability-cards modal completed or skipped.
+  // Replaced by FIRST_RUN_TOUR.
+  | "CAPABILITY_CARDS"
+  // The guided first run over the real sidebar, finished or skipped
+  | "FIRST_RUN_TOUR"
+  // One-time contextual tips: a second chat, a cost, an expert proposal
+  | "CHATS_TIP"
+  | "COST_TIP"
+  | "EXPERT_TIP"
+  // First-visit intro card for a tab, dismissed however the user chose
+  | "AGENTS_TAB_INTRO"
+  | "MARKETPLACE_TAB_INTRO"
+  | "BUILD_TAB_INTRO"
+  // Agents-to-workflows migration notice, dismissed or followed to Otto
+  | "WORKFLOWS_MOVED";
 
 export interface UserOnboarding {
-  completedSteps: OnboardingStep[];
+  // Plain string[] so legacy step names from existing rows pass through.
+  // Validation against the active set lives on the completion endpoint via
+  // `PostV1CompleteOnboardingStepStep` (the generated literal union).
+  completedSteps: string[];
   walletShown: boolean;
+  // Typed enum: `notified` is written back via PATCH /onboarding, which now
+  // validates step names against OnboardingStep at the boundary.
   notified: OnboardingStep[];
-  rewardedFor: OnboardingStep[];
+  rewardedFor: string[];
   usageReason: string | null;
   integrations: string[];
   otherIntegrations: string | null;
@@ -1040,6 +952,9 @@ export interface UserOnboarding {
 export interface OnboardingNotificationPayload {
   type: "onboarding";
   event: "step_completed" | "increment_runs";
+  // Typed enum: notifications only fire on fresh completions, so `step` is
+  // always a current OnboardingStep (or null for `increment_runs`). Legacy step
+  // names live only in stored rows, never in emitted notifications.
   step: OnboardingStep | null;
 }
 
@@ -1078,46 +993,6 @@ export interface OttoQuery {
   graph_id?: string;
 }
 
-export interface StoreListingWithVersions {
-  listing_id: string;
-  slug: string;
-  agent_id: string;
-  agent_version: number;
-  active_version_id: string | null;
-  has_approved_version: boolean;
-  creator_email: string | null;
-  latest_version: StoreSubmission | null;
-  versions: StoreSubmission[];
-}
-
-export interface StoreListingsWithVersionsResponse {
-  listings: StoreListingWithVersions[];
-  pagination: Pagination;
-}
-
-// Admin API Types
-export type AdminSubmissionsRequest = {
-  status?: SubmissionStatus;
-  search?: string;
-  page: number;
-  page_size: number;
-};
-
-export type AdminListingHistoryRequest = {
-  listing_id: string;
-  page: number;
-  page_size: number;
-};
-
-export type AdminSubmissionDetailsRequest = {
-  store_listing_version_id: string;
-};
-
-export type AdminPendingSubmissionsRequest = {
-  page: number;
-  page_size: number;
-};
-
 export enum CreditTransactionType {
   TOP_UP = "TOP_UP",
   USAGE = "USAGE",
@@ -1135,6 +1010,7 @@ export type AddUserCreditsResponse = {
   new_balance: number;
   transaction_key: string;
 };
+
 const _stringFormatToDataTypeMap: Partial<Record<string, DataType>> = {
   date: DataType.DATE,
   time: DataType.TIME,
@@ -1179,7 +1055,7 @@ function _handleSingleTypeSchema(subSchema: BlockIOSubSchema): DataType {
   if (subSchema.type === "object") {
     if (
       ("additionalProperties" in subSchema && subSchema.additionalProperties) ||
-      !("properties" in subSchema)
+      !("properties" in subSchema && subSchema.properties)
     ) {
       return DataType.KEY_VALUE; // if additionalProperties / no properties => key-value
     }
@@ -1196,6 +1072,20 @@ function _handleSingleTypeSchema(subSchema: BlockIOSubSchema): DataType {
 }
 
 export function determineDataType(schema: BlockIOSubSchema): DataType {
+  return resolveDataType(schema).type;
+}
+
+/**
+ * The data type a value's schema calls for, and the schema that holds what its
+ * control needs: the non-null member of an optional field's `anyOf`, or the
+ * schema an `allOf` wraps. A select's options and a multi-select's keys live
+ * there, not on the wrapper, so read them from here (BUILDER-93V). A table is
+ * the exception: its columns are on the field itself.
+ */
+export function resolveDataType(schema: BlockIOSubSchema): {
+  type: DataType;
+  schema: BlockIOSubSchema;
+} {
   if ("allOf" in schema) {
     // If this happens, that is because Pydantic wraps $refs in an allOf if the
     // $ref has sibling schema properties (which isn't technically allowed),
@@ -1209,19 +1099,19 @@ export function determineDataType(schema: BlockIOSubSchema): DataType {
 
   // Credentials override
   if ("credentials_provider" in schema) {
-    return DataType.CREDENTIALS;
+    return { type: DataType.CREDENTIALS, schema };
   }
 
   if (
     "google_drive_picker_config" in schema ||
     ("format" in schema && schema.format === "google-drive-picker")
   ) {
-    return DataType.GOOGLE_DRIVE_PICKER;
+    return { type: DataType.GOOGLE_DRIVE_PICKER, schema };
   }
 
   // enum == SELECT
   if ("enum" in schema) {
-    return DataType.SELECT;
+    return { type: DataType.SELECT, schema };
   }
 
   // Handle anyOf => optional types (string|null, number|null, etc.)
@@ -1236,56 +1126,45 @@ export function determineDataType(schema: BlockIOSubSchema): DataType {
       const strSchema = schema.anyOf.find(
         (s) => s.type === "string",
       ) as BlockIOStringSubSchema;
-      return _handleStringSchema(strSchema);
+      return { type: _handleStringSchema(strSchema), schema: strSchema };
     }
 
-    // (number|integer) & null
-    if (
-      (types.includes("number") || types.includes("integer")) &&
-      types.includes("null")
-    ) {
-      // Just reuse our single-type logic for whichever is not null
-      const numSchema = schema.anyOf.find(
-        (s) => s.type === "number" || s.type === "integer",
-      );
-      if (numSchema) {
-        return _handleSingleTypeSchema(numSchema);
-      }
-      return DataType.NUMBER; // fallback
+    // (number|integer) & null: reuse the single-type logic for the number
+    const numSchema = schema.anyOf.find(
+      (s) => s.type === "number" || s.type === "integer",
+    );
+    if (numSchema && types.includes("null")) {
+      return { type: _handleSingleTypeSchema(numSchema), schema: numSchema };
     }
 
     // (array | null)
-    if (types.includes("array") && types.includes("null")) {
-      // Check for table format on the parent schema (where anyOf is)
+    const arrSchema = schema.anyOf.find((s) => s.type === "array");
+    if (arrSchema && types.includes("null")) {
+      // AgentTableInputBlock writes the table format and its columns (`items`)
+      // on the field itself, beside an anyOf member that has neither.
       if ("format" in schema && schema.format === "table") {
-        return DataType.TABLE;
+        return { type: DataType.TABLE, schema };
       }
-
-      const arrSchema = schema.anyOf.find((s) => s.type === "array");
-      if (arrSchema) return _handleSingleTypeSchema(arrSchema);
-      return DataType.ARRAY;
+      return { type: _handleSingleTypeSchema(arrSchema), schema: arrSchema };
     }
 
     // (object | null)
-    if (types.includes("object") && types.includes("null")) {
-      const objSchema = schema.anyOf.find(
-        (s) => s.type === "object",
-      ) as BlockIOObjectSubSchema;
-      if (objSchema) return _handleSingleTypeSchema(objSchema);
-      return DataType.OBJECT;
+    const objSchema = schema.anyOf.find((s) => s.type === "object");
+    if (objSchema && types.includes("null")) {
+      return { type: _handleSingleTypeSchema(objSchema), schema: objSchema };
     }
   }
 
   // oneOf + discriminator => user picks which variant => SELECT
   if ("oneOf" in schema && "discriminator" in schema && schema.discriminator) {
-    return DataType.SELECT;
+    return { type: DataType.SELECT, schema };
   }
 
   // Direct type
   if ("type" in schema) {
-    return _handleSingleTypeSchema(schema);
+    return { type: _handleSingleTypeSchema(schema), schema };
   }
 
   // Fallback
-  return DataType.SHORT_TEXT;
+  return { type: DataType.SHORT_TEXT, schema };
 }

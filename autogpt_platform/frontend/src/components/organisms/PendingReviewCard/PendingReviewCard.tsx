@@ -1,75 +1,73 @@
 import { PendingHumanReviewModel } from "@/app/api/__generated__/models/pendingHumanReviewModel";
 import { Text } from "@/components/atoms/Text/Text";
-import { Button } from "@/components/atoms/Button/Button";
 import { Input } from "@/components/atoms/Input/Input";
 import { Switch } from "@/components/atoms/Switch/Switch";
-import { TrashIcon, EyeSlashIcon } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { JsonDataInput } from "./components/JsonDataInput/JsonDataInput";
+import { ReviewInputFields } from "./components/ReviewInputFields/ReviewInputFields";
+import { reviewFields } from "./components/ReviewInputFields/helpers";
+import { useReviewBlockSchema } from "./components/ReviewInputFields/useReviewBlockSchema";
 
-interface StructuredReviewPayload {
-  data: unknown;
-  instructions?: string;
-}
-
-function isStructuredReviewPayload(
-  payload: unknown,
-): payload is StructuredReviewPayload {
-  return (
-    payload !== null &&
-    typeof payload === "object" &&
-    "data" in payload &&
-    (typeof (payload as any).instructions === "string" ||
-      (payload as any).instructions === undefined)
-  );
-}
-
-function extractReviewData(payload: unknown): {
-  data: unknown;
-  instructions?: string;
-} {
-  if (isStructuredReviewPayload(payload)) {
-    return {
-      data: payload.data,
-      instructions: payload.instructions,
-    };
-  }
-
-  return { data: payload };
-}
+type ReviewPayload = PendingHumanReviewModel["payload"];
 
 interface PendingReviewCardProps {
   review: PendingHumanReviewModel;
   onReviewDataChange: (nodeExecId: string, data: string) => void;
-  reviewMessage?: string;
-  onReviewMessageChange?: (nodeExecId: string, message: string) => void;
-  isDisabled?: boolean;
-  onToggleDisabled?: (nodeExecId: string) => void;
+  autoApproveFuture?: boolean;
+  onAutoApproveFutureChange?: (nodeExecId: string, enabled: boolean) => void;
+  externalDataValue?: string;
+  showAutoApprove?: boolean;
+  nodeId?: string;
 }
 
 export function PendingReviewCard({
   review,
   onReviewDataChange,
-  reviewMessage = "",
-  onReviewMessageChange,
-  isDisabled = false,
-  onToggleDisabled,
+  autoApproveFuture = false,
+  onAutoApproveFutureChange,
+  externalDataValue,
+  showAutoApprove = true,
+  nodeId,
 }: PendingReviewCardProps) {
-  const extractedData = extractReviewData(review.payload);
   const isDataEditable = review.editable;
-  const instructions = extractedData.instructions || review.instructions;
-  const [currentData, setCurrentData] = useState(extractedData.data);
 
-  const handleDataChange = (newValue: unknown) => {
+  // A block's review names the block in `action`; a human-in-the-loop block's
+  // instructions are the author's own words, shown above its data.
+  const instructions = review.action ? undefined : review.instructions;
+  const { schema, isLoading: isSchemaLoading } = useReviewBlockSchema(
+    review.block_id,
+  );
+
+  // Render the payload as stored: it is exactly what the reviewer's decision
+  // sends back as the block's input, so unwrapping any key here would show
+  // one thing and execute another.
+  const [currentData, setCurrentData] = useState<ReviewPayload>(review.payload);
+
+  useEffect(() => {
+    if (externalDataValue !== undefined) {
+      try {
+        const parsedData = JSON.parse(externalDataValue);
+        setCurrentData(parsedData);
+      } catch {}
+    }
+  }, [externalDataValue]);
+
+  function handleDataChange(newValue: ReviewPayload) {
     setCurrentData(newValue);
     onReviewDataChange(review.node_exec_id, JSON.stringify(newValue, null, 2));
-  };
+  }
 
-  const handleMessageChange = (newMessage: string) => {
-    onReviewMessageChange?.(review.node_exec_id, newMessage);
+  const renderFields = (readOnly: boolean) => {
+    if (!isPlainObject(currentData) || isSchemaLoading) return null;
+    return (
+      <ReviewInputFields
+        fields={reviewFields(currentData, schema)}
+        values={currentData}
+        onChange={(values) => handleDataChange(values as ReviewPayload)}
+        readOnly={readOnly}
+      />
+    );
   };
-
-  // Show simplified view when no toggle functionality is provided (Screenshot 1 mode)
-  const showSimplified = !onToggleDisabled;
 
   const renderDataInput = () => {
     const data = currentData;
@@ -103,8 +101,14 @@ export function PendingReviewCard({
       );
     } else if (typeof data === "boolean") {
       return (
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-gray-500">
+        <div
+          data-slot="pending-review-card-toggle"
+          className="flex items-center gap-3"
+        >
+          <span
+            data-slot="pending-review-card-toggle-label"
+            className="text-body text-foreground-tertiary"
+          >
             {data ? "Enabled" : "Disabled"}
           </span>
           <Switch
@@ -116,118 +120,84 @@ export function PendingReviewCard({
       );
     } else {
       return (
-        <Input
-          id="data-json"
-          label="Value"
-          hideLabel
-          size="small"
-          type="textarea"
-          rows={6}
-          value={JSON.stringify(data, null, 2)}
-          onChange={(e) => {
-            try {
-              const parsed = JSON.parse(e.target.value);
-              handleDataChange(parsed);
-            } catch {}
-          }}
-          placeholder="Edit JSON data"
-          className="font-mono text-sm"
+        <JsonDataInput
+          value={data}
+          initialText={externalDataValue}
+          onChange={(value) => handleDataChange(value as ReviewPayload)}
+          onInvalidDraft={(text) =>
+            onReviewDataChange(review.node_exec_id, text)
+          }
         />
       );
     }
   };
 
-  // Helper function to get proper field label
-  const getFieldLabel = (instructions?: string) => {
-    if (instructions)
-      return instructions.charAt(0).toUpperCase() + instructions.slice(1);
-    return "Data to Review";
+  const getShortenedNodeId = (id: string) => {
+    if (id.length <= 8) return id;
+    return `${id.slice(0, 4)}...${id.slice(-4)}`;
   };
 
-  // Use the existing HITL review interface
   return (
-    <div className="space-y-4">
-      {!showSimplified && (
-        <div className="flex items-start justify-between">
-          <div className="flex-1">
-            {isDisabled && (
-              <Text variant="small" className="text-muted-foreground">
-                This item will be rejected
-              </Text>
-            )}
-          </div>
-          <Button
-            onClick={() => onToggleDisabled!(review.node_exec_id)}
-            variant={isDisabled ? "primary" : "secondary"}
-            size="small"
-            leftIcon={
-              isDisabled ? <EyeSlashIcon size={14} /> : <TrashIcon size={14} />
-            }
+    <div data-slot="pending-review-card" className="space-y-4">
+      {nodeId && (
+        <Text variant="small" tone="muted">
+          Node #{getShortenedNodeId(nodeId)}
+        </Text>
+      )}
+
+      <div data-slot="pending-review-card-body" className="space-y-3">
+        {instructions && <Text variant="body-semibold">{instructions}</Text>}
+
+        {isPlainObject(currentData) ? (
+          renderFields(!isDataEditable || autoApproveFuture)
+        ) : isDataEditable && !autoApproveFuture ? (
+          renderDataInput()
+        ) : (
+          <div
+            data-slot="pending-review-card-readonly"
+            className="rounded-lg border border-border-base bg-surface p-3"
           >
-            {isDisabled ? "Include" : "Exclude"}
-          </Button>
-        </div>
-      )}
+            <Text variant="small" tone="secondary">
+              {JSON.stringify(currentData, null, 2)}
+            </Text>
+          </div>
+        )}
+      </div>
 
-      {/* Show instructions as field label */}
-      {instructions && (
-        <div className="space-y-3">
-          <Text variant="body" className="font-semibold text-gray-900">
-            {getFieldLabel(instructions)}
-          </Text>
-          {isDataEditable && !isDisabled ? (
-            renderDataInput()
-          ) : (
-            <div className="rounded-lg border border-gray-200 bg-white p-3">
-              <Text variant="small" className="text-gray-600">
-                {JSON.stringify(currentData, null, 2)}
+      {/* Auto-approve toggle for this review */}
+      {showAutoApprove && onAutoApproveFutureChange && (
+        <div
+          data-slot="pending-review-card-auto-approve"
+          className="space-y-2 pt-2"
+        >
+          <div
+            data-slot="pending-review-card-auto-approve-row"
+            className="flex items-center gap-3"
+          >
+            <Switch
+              checked={autoApproveFuture}
+              onCheckedChange={(enabled: boolean) =>
+                onAutoApproveFutureChange(review.node_exec_id, enabled)
+              }
+            />
+            <Text variant="small" tone="body">
+              Auto-approve future executions of this block
+            </Text>
+          </div>
+          {autoApproveFuture && (
+            <div className="pl-11">
+              <Text variant="small" tone="muted">
+                Original data will be used for this and all future reviews from
+                this block.
               </Text>
             </div>
           )}
-        </div>
-      )}
-
-      {/* If no instructions, show data directly */}
-      {!instructions && (
-        <div className="space-y-3">
-          <Text variant="body" className="font-semibold text-gray-900">
-            Data to Review
-            {!isDataEditable && (
-              <span className="ml-2 text-xs text-muted-foreground">
-                (Read-only)
-              </span>
-            )}
-          </Text>
-          {isDataEditable && !isDisabled ? (
-            renderDataInput()
-          ) : (
-            <div className="rounded-lg border border-gray-200 bg-white p-3">
-              <Text variant="small" className="text-gray-600">
-                {JSON.stringify(currentData, null, 2)}
-              </Text>
-            </div>
-          )}
-        </div>
-      )}
-
-      {!showSimplified && isDisabled && (
-        <div>
-          <Text variant="body" className="mb-2 font-semibold">
-            Rejection Reason (Optional):
-          </Text>
-          <Input
-            id="rejection-reason"
-            label="Rejection Reason"
-            hideLabel
-            size="small"
-            type="textarea"
-            rows={3}
-            value={reviewMessage}
-            onChange={(e) => handleMessageChange(e.target.value)}
-            placeholder="Add any notes about why you're rejecting this..."
-          />
         </div>
       )}
     </div>
   );
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

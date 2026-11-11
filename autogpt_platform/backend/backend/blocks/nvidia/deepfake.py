@@ -1,14 +1,15 @@
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.nvidia._auth import (
     NvidiaCredentials,
     NvidiaCredentialsField,
     NvidiaCredentialsInput,
-)
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
 )
 from backend.data.model import SchemaField
 from backend.util.request import Requests
@@ -44,6 +45,7 @@ class NvidiaDeepfakeDetectBlock(Block):
             categories={BlockCategory.SAFETY},
             input_schema=NvidiaDeepfakeDetectBlock.Input,
             output_schema=NvidiaDeepfakeDetectBlock.Output,
+            effect=BlockEffect.READ,
         )
 
     async def run(

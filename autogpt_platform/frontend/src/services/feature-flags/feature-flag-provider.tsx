@@ -1,57 +1,17 @@
 "use client";
 
-import { LDProvider } from "launchdarkly-react-client-sdk";
+import { useAuth } from "@/lib/auth/hooks/useAuth";
 import type { ReactNode } from "react";
-import { useMemo } from "react";
-import { useSupabase } from "@/lib/supabase/hooks/useSupabase";
-import * as Sentry from "@sentry/nextjs";
-import { environment } from "../environment";
+import { FlagResolutionContext } from "./flag-resolution";
 
-const clientId = process.env.NEXT_PUBLIC_LAUNCHDARKLY_CLIENT_ID;
-const envEnabled = process.env.NEXT_PUBLIC_LAUNCHDARKLY_ENABLED === "true";
+export function FeatureFlagProvider({ children }: { children: ReactNode }) {
+  const { isUserLoading } = useAuth();
 
-export function LaunchDarklyProvider({ children }: { children: ReactNode }) {
-  const { user, isUserLoading } = useSupabase();
-  const isCloud = environment.isCloud();
-  const isLaunchDarklyConfigured = isCloud && envEnabled && clientId;
-
-  const context = useMemo(() => {
-    if (isUserLoading || !user) {
-      return {
-        kind: "user" as const,
-        key: "anonymous",
-        anonymous: true,
-      };
-    }
-
-    return {
-      kind: "user" as const,
-      key: user.id,
-      ...(user.email && { email: user.email }),
-      anonymous: false,
-      custom: {
-        ...(user.role && { role: user.role }),
-      },
-    };
-  }, [user, isUserLoading]);
-
-  if (!isLaunchDarklyConfigured) {
-    return <>{children}</>;
-  }
-
+  // The server reads flags for the signed-in user, so the wait starts once the
+  // session is known. The page renders regardless so crawlers get its content.
   return (
-    <LDProvider
-      // Add this key prop. It will be 'anonymous' when logged out,
-      key={context.key}
-      clientSideID={clientId}
-      context={context}
-      reactOptions={{ useCamelCaseFlagKeys: false }}
-      options={{
-        bootstrap: "localStorage",
-        inspectors: [Sentry.buildLaunchDarklyFlagUsedHandler()],
-      }}
-    >
+    <FlagResolutionContext.Provider value={!isUserLoading}>
       {children}
-    </LDProvider>
+    </FlagResolutionContext.Provider>
   );
 }

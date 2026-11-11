@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useBlockMenuStore } from "@/app/(platform)/build/stores/blockMenuStore";
+import { useShallow } from "zustand/react/shallow";
 import { useAddAgentToBuilder } from "../hooks/useAddAgentToBuilder";
 import {
   getPaginationNextPageNumber,
@@ -23,7 +24,7 @@ import { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
 import { getQueryClient } from "@/lib/react-query/queryClient";
 import { useToast } from "@/components/molecules/Toast/use-toast";
 import * as Sentry from "@sentry/nextjs";
-import { GetV2BuilderSearchFilterAnyOfItem } from "@/app/api/__generated__/models/getV2BuilderSearchFilterAnyOfItem";
+import { CategoryCounts } from "../BlockMenuFilters/types";
 
 export const useBlockMenuSearchContent = () => {
   const {
@@ -34,7 +35,17 @@ export const useBlockMenuSearchContent = () => {
     setCreatorsList,
     creators,
     setCategoryCounts,
-  } = useBlockMenuStore();
+  } = useBlockMenuStore(
+    useShallow((state) => ({
+      searchQuery: state.searchQuery,
+      searchId: state.searchId,
+      setSearchId: state.setSearchId,
+      filters: state.filters,
+      setCreatorsList: state.setCreatorsList,
+      creators: state.creators,
+      setCategoryCounts: state.setCategoryCounts,
+    })),
+  );
 
   const { toast } = useToast();
   const { addAgentToBuilder, addLibraryAgentToBuilder } =
@@ -67,7 +78,7 @@ export const useBlockMenuSearchContent = () => {
       page_size: 8,
       search_query: searchQuery,
       search_id: searchId,
-      filter: filters.length > 0 ? filters : undefined,
+      filter: filters.length > 0 ? filters.join(",") : undefined,
       by_creator: creators.length > 0 ? creators : undefined,
     },
     {
@@ -89,7 +100,7 @@ export const useBlockMenuSearchContent = () => {
       onError: (error) => {
         Sentry.captureException(error);
         toast({
-          title: "Failed to add agent to library",
+          title: "Failed to add workflow to library",
           description:
             ((error as any).message as string) ||
             "An unexpected error occurred.",
@@ -117,10 +128,7 @@ export const useBlockMenuSearchContent = () => {
     }
     const latestData = okData(searchQueryData.pages.at(-1));
     setCategoryCounts(
-      (latestData?.total_items as Record<
-        GetV2BuilderSearchFilterAnyOfItem,
-        number
-      >) || {
+      (latestData?.total_items as CategoryCounts) || {
         blocks: 0,
         integrations: 0,
         marketplace_agents: 0,
@@ -136,9 +144,10 @@ export const useBlockMenuSearchContent = () => {
     }
   }, [resetSearchSession, searchId, searchQuery]);
 
-  const searchResults = searchQueryData
-    ? unpaginate(searchQueryData, "items")
-    : [];
+  const searchResults = useMemo(
+    () => (searchQueryData ? unpaginate(searchQueryData, "items") : []),
+    [searchQueryData],
+  );
 
   const handleAddLibraryAgent = async (agent: LibraryAgent) => {
     setAddingLibraryAgentId(agent.id);
@@ -184,13 +193,13 @@ export const useBlockMenuSearchContent = () => {
       addAgentToBuilder(libraryAgentDetails as LibraryAgent);
 
       toast({
-        title: "Agent Added",
-        description: "Agent has been added to your library and builder",
+        title: "Workflow Added",
+        description: "Workflow has been added to your library and builder",
       });
     } catch (error) {
       Sentry.captureException(error);
       toast({
-        title: "Failed to add agent to library",
+        title: "Failed to add workflow to library",
         description:
           ((error as any).message as string) || "An unexpected error occurred.",
         variant: "destructive",

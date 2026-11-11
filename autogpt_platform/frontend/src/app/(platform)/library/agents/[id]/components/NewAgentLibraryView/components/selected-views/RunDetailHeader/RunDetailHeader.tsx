@@ -1,10 +1,13 @@
 import { GraphExecution } from "@/app/api/__generated__/models/graphExecution";
 import { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
 import { Text } from "@/components/atoms/Text/Text";
-import { ClockClockwiseIcon } from "@phosphor-icons/react";
-import moment from "moment";
+import { formatDistanceToNow, formatDistanceStrict } from "date-fns";
 import { AGENT_LIBRARY_SECTION_PADDING_X } from "../../../helpers";
 import { RunStatusBadge } from "../SelectedRunView/components/RunStatusBadge";
+import { FlaskConicalIcon, TimeScheduleIcon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import { useIsBillingEnabled } from "@/hooks/useIsBillingEnabled";
+import { isCompletedWithErrors } from "@/lib/run-health";
 
 type Props = {
   agent: LibraryAgent;
@@ -15,6 +18,7 @@ type Props = {
 };
 
 export function RunDetailHeader({ agent, run, scheduleRecurrence }: Props) {
+  const isBillingEnabled = useIsBillingEnabled();
   return (
     <div className={AGENT_LIBRARY_SECTION_PADDING_X}>
       <div className="flex w-full items-center justify-between">
@@ -22,61 +26,71 @@ export function RunDetailHeader({ agent, run, scheduleRecurrence }: Props) {
           <div className="flex w-full flex-col flex-wrap items-start justify-between gap-1 md:flex-row md:items-center">
             <div className="flex min-w-0 flex-1 flex-col items-start gap-3">
               {run?.status ? (
-                <RunStatusBadge status={run.status} />
-              ) : scheduleRecurrence ? (
-                <div className="inline-flex items-center gap-1 rounded-md bg-yellow-50 p-1">
-                  <ClockClockwiseIcon
-                    size={16}
-                    className="text-yellow-700"
-                    weight="bold"
+                <div className="flex items-center gap-2">
+                  <RunStatusBadge
+                    status={run.status}
+                    completedWithErrors={isCompletedWithErrors(run)}
                   />
-                  <Text variant="small-medium" className="text-yellow-700">
+                  {run.is_dry_run && (
+                    <div className="inline-flex items-center gap-1 rounded-md bg-warning-surface p-1 text-warning-foreground">
+                      <Icon icon={FlaskConicalIcon} size={16} />
+                      <Text variant="small-medium" tone="warning">
+                        Simulated
+                      </Text>
+                    </div>
+                  )}
+                </div>
+              ) : scheduleRecurrence ? (
+                <div className="inline-flex items-center gap-1 rounded-md bg-warning-surface p-1 text-yellow-foreground">
+                  <Icon icon={TimeScheduleIcon} size={16} />
+                  <Text variant="small-medium" tone="inherit">
                     Scheduled
                   </Text>
                 </div>
               ) : null}
-              <Text variant="h2" className="truncate text-ellipsis">
-                {agent.name}
-              </Text>
+              <Text variant="h2">{agent.name}</Text>
             </div>
           </div>
           {run ? (
-            <div className="mt-1 flex flex-wrap items-center gap-2 gap-y-1 text-zinc-400">
-              <Text variant="small" className="text-zinc-500">
-                Started {moment(run.started_at).fromNow()}
+            <div className="mt-1 flex flex-wrap items-center gap-2 gap-y-1 text-foreground-subtle">
+              <Text variant="small" tone="muted">
+                Started{" "}
+                {run.started_at
+                  ? formatDistanceToNow(run.started_at, { addSuffix: true })
+                  : "—"}
               </Text>
-              <span className="mx-1 inline-block text-zinc-200">|</span>
-              <Text variant="small" className="text-zinc-500">
+              <span className="mx-1 inline-block text-border-base">|</span>
+              <Text variant="small" tone="muted">
                 Version: {run.graph_version}
               </Text>
               {run.stats?.node_exec_count !== undefined && (
                 <>
-                  <span className="mx-1 inline-block text-zinc-200">|</span>
-                  <Text variant="small" className="text-zinc-500">
+                  <span className="mx-1 inline-block text-border-base">|</span>
+                  <Text variant="small" tone="muted">
                     Steps: {run.stats.node_exec_count}
                   </Text>
                 </>
               )}
               {run.stats?.duration !== undefined && (
                 <>
-                  <span className="mx-1 inline-block text-zinc-200">|</span>
-                  <Text variant="small" className="text-zinc-500">
+                  <span className="mx-1 inline-block text-border-base">|</span>
+                  <Text variant="small" tone="muted">
                     Duration:{" "}
-                    {moment.duration(run.stats.duration, "seconds").humanize()}
+                    {formatDistanceStrict(0, run.stats.duration * 1000)}
                   </Text>
                 </>
               )}
-              {run.stats?.cost !== undefined && (
+              {isBillingEnabled && run.stats?.cost !== undefined && (
                 <>
-                  <span className="mx-1 inline-block text-zinc-200">|</span>
-                  <Text variant="small" className="text-zinc-500">
+                  <span className="mx-1 inline-block text-border-base">|</span>
+                  <Text variant="small" tone="muted">
                     Cost: ${(run.stats.cost / 100).toFixed(2)}
                   </Text>
                 </>
               )}
             </div>
           ) : scheduleRecurrence ? (
-            <Text variant="small" className="mt-1 !text-zinc-600">
+            <Text variant="small" tone="secondary" className="mt-1">
               {scheduleRecurrence}
             </Text>
           ) : null}

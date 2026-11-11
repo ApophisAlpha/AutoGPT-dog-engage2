@@ -3,7 +3,7 @@ from enum import Enum
 
 from pydantic import BaseModel
 
-from backend.data.block import BlockSchemaInput
+from backend.blocks._base import BlockSchemaInput
 from backend.data.model import SchemaField
 
 # -------------- Tweets -----------------
@@ -53,30 +53,6 @@ class TweetFieldsFilter(BaseModel):
     Tweet_Source: bool = False
     Tweet_Text: bool = False
     Withheld_Content: bool = False
-
-
-class PersonalTweetFieldsFilter(BaseModel):
-    attachments: bool = False
-    author_id: bool = False
-    context_annotations: bool = False
-    conversation_id: bool = False
-    created_at: bool = False
-    edit_controls: bool = False
-    entities: bool = False
-    geo: bool = False
-    id: bool = False
-    in_reply_to_user_id: bool = False
-    lang: bool = False
-    non_public_metrics: bool = False
-    public_metrics: bool = False
-    organic_metrics: bool = False
-    promoted_metrics: bool = False
-    possibly_sensitive: bool = False
-    referenced_tweets: bool = False
-    reply_settings: bool = False
-    source: bool = False
-    text: bool = False
-    withheld: bool = False
 
 
 class TweetPollFieldsFilter(BaseModel):

@@ -1,5 +1,9 @@
 import { CredentialsMetaInput } from "@/app/api/__generated__/models/credentialsMetaInput";
-import { getCredentialDisplayName } from "../../helpers";
+import { CredentialsType } from "@/lib/autogpt-server-api/types";
+import {
+  getCredentialDisplayName,
+  getCredentialTypeLabel,
+} from "../../helpers";
 import { CredentialRow } from "../CredentialRow/CredentialRow";
 
 interface Props {
@@ -86,11 +90,12 @@ export function CredentialsSelect({
           )}
           {credentials.map((credential) => (
             <option key={credential.id} value={credential.id}>
-              {getCredentialDisplayName(credential, displayName)}
+              {getCredentialDisplayName(credential, displayName)} (
+              {getCredentialTypeLabel(credential.type as CredentialsType)})
             </option>
           ))}
         </select>
-        <div className="rounded-medium border border-zinc-200 bg-white">
+        <div className="rounded-medium border border-border-base bg-surface">
           <CredentialRow
             credential={displayCredential}
             provider={provider}

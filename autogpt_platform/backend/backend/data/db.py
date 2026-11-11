@@ -1,7 +1,9 @@
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from typing import TypeVar, overload
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from uuid import uuid4
 
@@ -38,9 +40,35 @@ POOL_TIMEOUT = os.getenv("DB_POOL_TIMEOUT")
 if POOL_TIMEOUT:
     DATABASE_URL = add_param(DATABASE_URL, "pool_timeout", POOL_TIMEOUT)
 
+STMT_CACHE_SIZE = os.getenv("DB_STATEMENT_CACHE_SIZE")
+if STMT_CACHE_SIZE:
+    DATABASE_URL = add_param(DATABASE_URL, "statement_cache_size", STMT_CACHE_SIZE)
+
 HTTP_TIMEOUT = int(POOL_TIMEOUT) if POOL_TIMEOUT else None
 
-prisma = Prisma(
+
+class _ThreadBoundPrisma(Prisma):
+    """A Prisma client that reports itself connected only on the thread that
+    connected it.
+
+    Its HTTP connection pool belongs to that thread's event loop. Code running
+    on another thread's loop (direct block execution runs blocks on worker
+    loops) sees it as disconnected and takes the database manager RPC path, as
+    it does in the executor.
+    """
+
+    _connected_thread: int | None = None
+
+    async def connect(self, *args, **kwargs) -> None:
+        await super().connect(*args, **kwargs)
+        self._connected_thread = threading.get_ident()
+
+    def is_connected(self) -> bool:
+        owner = self._connected_thread
+        return super().is_connected() and owner in (None, threading.get_ident())
+
+
+prisma = _ThreadBoundPrisma(
     auto_register=True,
     http={"timeout": HTTP_TIMEOUT},
     datasource={"url": DATABASE_URL},
@@ -48,6 +76,7 @@ prisma = Prisma(
 
 
 logger = logging.getLogger(__name__)
+RawQueryModelT = TypeVar("RawQueryModelT", bound=BaseModel)
 
 
 def is_connected():
@@ -59,7 +88,12 @@ async def connect():
     if prisma.is_connected():
         return
 
-    await prisma.connect()
+    try:
+        await prisma.connect()
+    except Exception:
+        # A failed connect leaves is_connected() True, so the retry would return at once.
+        await prisma.disconnect(DISCONNECT_TIMEOUT)
+        raise
 
     if not prisma.is_connected():
         raise ConnectionError("Failed to connect to Prisma.")
@@ -72,12 +106,22 @@ async def connect():
     #     raise ConnectionError("Failed to connect to Prisma.") from e
 
 
+# Prisma shuts the query engine down by sending it SIGINT and then calling
+# ``subprocess.wait(timeout=...)``. Passing no timeout makes that wait
+# unbounded, so an engine that does not act on the SIGINT wedges the caller
+# forever — and because the wait is a blocking call inside an async function,
+# it takes the event loop with it. The visible symptom is a test session that
+# runs every test and then never prints its summary line. Bound the wait so
+# an unresponsive engine is SIGKILLed instead of hung on.
+DISCONNECT_TIMEOUT = timedelta(seconds=10)
+
+
 @conn_retry("Prisma", "Releasing connection")
 async def disconnect():
     if not prisma.is_connected():
         return
 
-    await prisma.disconnect()
+    await prisma.disconnect(DISCONNECT_TIMEOUT)
 
     if prisma.is_connected():
         raise ConnectionError("Failed to disconnect from Prisma.")
@@ -101,6 +145,20 @@ async def transaction(timeout: timedelta = TRANSACTION_TIMEOUT):
         yield tx
 
 
+@asynccontextmanager
+async def bounded_transaction(statement_timeout_ms: int):
+    """A transaction each of whose statements the database gives up on
+    after *statement_timeout_ms* (``statement_timeout``, for this transaction
+    only), cancelling it there, where a caller's own deadline only stops
+    waiting for it."""
+    async with transaction() as tx:
+        await tx.query_raw(
+            "SELECT set_config('statement_timeout', $1, true)",
+            str(statement_timeout_ms),
+        )
+        yield tx
+
+
 def get_database_schema() -> str:
     """Extract database schema from DATABASE_URL."""
     parsed_url = urlparse(DATABASE_URL)
@@ -113,7 +171,8 @@ async def _raw_with_schema(
     *args,
     execute: bool = False,
     client: Prisma | None = None,
-) -> list[dict] | int:
+    model: type[RawQueryModelT] | None = None,
+) -> list[dict] | list[RawQueryModelT] | int:
     """Internal: Execute raw SQL with proper schema handling.
 
     Use query_raw_with_schema() or execute_raw_with_schema() instead.
@@ -158,12 +217,32 @@ async def _raw_with_schema(
     if execute:
         result = await db_client.execute_raw(formatted_query, *args)  # type: ignore
     else:
-        result = await db_client.query_raw(formatted_query, *args)  # type: ignore
+        result = await db_client.query_raw(formatted_query, *args, model=model)  # type: ignore
 
     return result
 
 
-async def query_raw_with_schema(query_template: str, *args) -> list[dict]:
+@overload
+async def query_raw_with_schema(
+    query_template: str, *args, client: Prisma | None = None
+) -> list[dict]: ...
+
+
+@overload
+async def query_raw_with_schema(
+    query_template: str,
+    *args,
+    model: type[RawQueryModelT],
+    client: Prisma | None = None,
+) -> list[RawQueryModelT]: ...
+
+
+async def query_raw_with_schema(
+    query_template: str,
+    *args,
+    model: type[RawQueryModelT] | None = None,
+    client: Prisma | None = None,
+) -> list[dict] | list[RawQueryModelT]:
     """Execute raw SQL SELECT query with proper schema handling.
 
     Args:
@@ -179,7 +258,13 @@ async def query_raw_with_schema(query_template: str, *args) -> list[dict]:
             user_id
         )
     """
-    return await _raw_with_schema(query_template, *args, execute=False)  # type: ignore
+    return await _raw_with_schema(
+        query_template,
+        *args,
+        execute=False,
+        model=model,
+        client=client,
+    )  # type: ignore
 
 
 async def execute_raw_with_schema(

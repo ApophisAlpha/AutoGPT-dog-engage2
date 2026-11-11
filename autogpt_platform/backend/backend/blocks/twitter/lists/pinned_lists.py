@@ -3,6 +3,14 @@ from typing import cast
 import tweepy
 from tweepy.client import Response
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.twitter._auth import (
     TEST_CREDENTIALS,
     TEST_CREDENTIALS_INPUT,
@@ -23,13 +31,6 @@ from backend.blocks.twitter._types import (
     TweetUserFieldsFilter,
 )
 from backend.blocks.twitter.tweepy_exceptions import handle_tweepy_exception
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
-)
 from backend.data.model import SchemaField
 
 
@@ -63,6 +64,7 @@ class TwitterUnpinListBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("success", True)],
             test_mock={"unpin_list": lambda *args, **kwargs: True},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod
@@ -126,6 +128,7 @@ class TwitterPinListBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("success", True)],
             test_mock={"pin_list": lambda *args, **kwargs: True},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod
@@ -166,7 +169,7 @@ class TwitterGetPinnedListsBlock(Block):
 
     class Input(ListExpansionInputs):
         credentials: TwitterCredentialsInput = TwitterCredentialsField(
-            ["lists.read", "users.read", "offline.access"]
+            ["list.read", "users.read", "offline.access"]
         )
 
     class Output(BlockSchemaOutput):
@@ -212,6 +215,7 @@ class TwitterGetPinnedListsBlock(Block):
                     ["Twitter List"],
                 )
             },
+            effect=BlockEffect.READ,
         )
 
     @staticmethod

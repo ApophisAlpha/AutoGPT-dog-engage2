@@ -3,9 +3,10 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
@@ -132,6 +133,7 @@ class GithubCreateCheckRunBlock(Block):
                     "status": "completed",
                 }
             },
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod
@@ -294,6 +296,7 @@ class GithubUpdateCheckRunBlock(Block):
                     "conclusion": "success",
                 }
             },
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod

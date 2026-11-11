@@ -1,14 +1,40 @@
 import asyncio
-from typing import Dict, Set
+import json
+import logging
+from collections import Counter
+from typing import Awaitable, Callable, Dict, Optional, Set
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
+from redis.asyncio import Redis as AsyncRedis
+from redis.asyncio.client import PubSub as AsyncPubSub
+from redis.exceptions import RedisError
+from starlette.websockets import WebSocketState
 
-from backend.api.model import NotificationPayload, WSMessage, WSMethod
-from backend.data.execution import (
-    ExecutionEventType,
-    GraphExecutionEvent,
-    NodeExecutionEvent,
-)
+from backend.api.model import WSMessage, WSMethod
+from backend.data import redis_client as redis
+from backend.data.db_accessors import execution_db
+from backend.data.event_bus import _assert_no_wildcard
+from backend.data.execution import ExecutionEventType, exec_channel, graph_all_channel
+from backend.data.notification_bus import NotificationEvent
+from backend.util.settings import Settings
+
+logger = logging.getLogger(__name__)
+_settings = Settings()
+
+
+def _is_ws_close_race(exc: BaseException, websocket: WebSocket) -> bool:
+    """A SPUBLISH→WS send racing with WS close — benign, drop quietly."""
+    if isinstance(exc, WebSocketDisconnect):
+        return True
+    if (
+        getattr(websocket, "application_state", None) == WebSocketState.DISCONNECTED
+        or getattr(websocket, "client_state", None) == WebSocketState.DISCONNECTED
+    ):
+        return True
+    if isinstance(exc, RuntimeError) and "close message has been sent" in str(exc):
+        return True
+    return False
+
 
 _EVENT_TYPE_TO_METHOD_MAP: dict[ExecutionEventType, WSMethod] = {
     ExecutionEventType.GRAPH_EXEC_UPDATE: WSMethod.GRAPH_EXECUTION_EVENT,
@@ -16,128 +42,494 @@ _EVENT_TYPE_TO_METHOD_MAP: dict[ExecutionEventType, WSMethod] = {
 }
 
 
+def event_bus_channel(channel_key: str) -> str:
+    """Prefix a channel key with the execution event bus name."""
+    return f"{_settings.config.execution_event_bus_name}/{channel_key}"
+
+
+def _notification_bus_channel(user_id: str) -> str:
+    """Return the full sharded channel name for a user's notifications."""
+    return f"{_settings.config.notification_event_bus_name}/{user_id}"
+
+
+MessageHandler = Callable[[Optional[bytes | str]], Awaitable[None]]
+LostHandler = Callable[[], Awaitable[None]]
+
+# Execution subscriptions one socket may hold. The notification channel each
+# socket gets on connect is not counted.
+MAX_SUBSCRIPTIONS_PER_SOCKET = 1000
+# Sockets one user may hold open on this server process.
+MAX_SOCKETS_PER_USER = 32
+# Shard streams (Redis connections) this process may hold per shard, over all
+# its sockets; while a shard is at it, new sockets are refused.
+MAX_STREAMS_PER_SHARD = 300
+# Streams one user may open on a shard while it has room; beyond this share a
+# user may not take the shard's last quarter, so heavy users can't fill it.
+STREAMS_PER_USER_SHARE = 8
+# Opening a shard connection retries for minutes while Redis is down; give up
+# sooner so the handler answers and the router reads the socket again.
+_STREAM_OPEN_TIMEOUT_S = 15.0
+
+WS_CLOSE_EVENT_STREAM_LOST = 1011
+WS_CLOSE_TRY_AGAIN_LATER = 1013
+
+Shard = tuple[str, int]
+
+
+class _StreamCapacityError(ValueError):
+    """A shard had no room left for this user's stream."""
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
+        # channel_key → sockets subscribed (public channel keys, not raw Redis channels)
         self.subscriptions: Dict[str, Set[WebSocket]] = {}
-        self.user_connections: Dict[str, Set[WebSocket]] = {}
+        # websocket → {channel_key: full Redis channel}
+        self._ws_subs: dict[WebSocket, dict[str, str]] = {}
+        # websocket → its notification channel
+        self._ws_notifications: dict[WebSocket, str] = {}
+        # websocket → {shard: the one connection it subscribes over there}
+        self._ws_streams: dict[WebSocket, dict[Shard, _ShardStream]] = {}
+        # user_id → that user's sockets on this process
+        self._user_sockets: dict[str, set[WebSocket]] = {}
+        # shard → shard streams open to it from this process
+        self._streams_per_shard: Counter[Shard] = Counter()
+        # (user_id, shard) → that user's streams open to it
+        self._user_streams: Counter[tuple[str, Shard]] = Counter()
 
-    async def connect_socket(self, websocket: WebSocket, *, user_id: str):
-        await websocket.accept()
+    async def connect_socket(self, websocket: WebSocket, *, user_id: str) -> bool:
+        """Accept the socket, or close it with 1013 and return False when the
+        user holds ``MAX_SOCKETS_PER_USER`` here or a shard has no room left
+        for the user's streams."""
+        held = len(self._user_sockets.get(user_id, ()))
+        if held >= MAX_SOCKETS_PER_USER or self._a_shard_is_full(user_id):
+            await self._refuse(websocket, user_id)
+            return False
+        self._user_sockets.setdefault(user_id, set()).add(websocket)
+        try:
+            await websocket.accept()
+        except BaseException:
+            self._release_user_socket(user_id, websocket)
+            raise
         self.active_connections.add(websocket)
-        if user_id not in self.user_connections:
-            self.user_connections[user_id] = set()
-        self.user_connections[user_id].add(websocket)
+        self._ws_subs.setdefault(websocket, {})
+        try:
+            await self._start_notification_subscription(websocket, user_id=user_id)
+        except _StreamCapacityError:
+            # Capacity moved between admission and here; don't hand back a
+            # socket that will never receive a notification.
+            try:
+                await websocket.close(
+                    code=WS_CLOSE_TRY_AGAIN_LATER, reason="Try again later"
+                )
+            finally:
+                await self.disconnect_socket(websocket, user_id=user_id)
+            return False
+        return True
 
-    def disconnect_socket(self, websocket: WebSocket, *, user_id: str):
+    async def disconnect_socket(self, websocket: WebSocket, *, user_id: str):
         self.active_connections.discard(websocket)
-        for subscribers in self.subscriptions.values():
+        self._release_user_socket(user_id, websocket)
+        # Stop the shard streams before dropping bookkeeping to avoid leaks.
+        for shard, stream in self._ws_streams.pop(websocket, {}).items():
+            await stream.stop()
+            self._release_stream(user_id, shard)
+        self._ws_notifications.pop(websocket, None)
+        for channel_key in self._ws_subs.pop(websocket, {}):
+            subscribers = self.subscriptions.get(channel_key)
+            if subscribers is None:
+                continue
             subscribers.discard(websocket)
-        user_conns = self.user_connections.get(user_id)
-        if user_conns is not None:
-            user_conns.discard(websocket)
-            if not user_conns:
-                self.user_connections.pop(user_id, None)
+            if not subscribers:
+                self.subscriptions.pop(channel_key, None)
 
     async def subscribe_graph_exec(
         self, *, user_id: str, graph_exec_id: str, websocket: WebSocket
     ) -> str:
-        return await self._subscribe(
-            _graph_exec_channel_key(user_id, graph_exec_id=graph_exec_id), websocket
+        # Hash-tagged channel needs graph_id; resolve once per subscribe.
+        meta = await execution_db().get_graph_execution_meta(
+            user_id=user_id, execution_id=graph_exec_id
         )
+        if meta is None:
+            raise ValueError(
+                f"graph_exec #{graph_exec_id} not found for user #{user_id}"
+            )
+        channel_key = graph_exec_channel_key(user_id, graph_exec_id=graph_exec_id)
+        full_channel = event_bus_channel(
+            exec_channel(user_id, meta.graph_id, graph_exec_id)
+        )
+        await self._open_subscription(user_id, websocket, channel_key, full_channel)
+        return channel_key
 
     async def subscribe_graph_execs(
         self, *, user_id: str, graph_id: str, websocket: WebSocket
     ) -> str:
-        return await self._subscribe(
-            _graph_execs_channel_key(user_id, graph_id=graph_id), websocket
-        )
+        channel_key = _graph_execs_channel_key(user_id, graph_id=graph_id)
+        full_channel = event_bus_channel(graph_all_channel(user_id, graph_id))
+        await self._open_subscription(user_id, websocket, channel_key, full_channel)
+        return channel_key
 
     async def unsubscribe_graph_exec(
         self, *, user_id: str, graph_exec_id: str, websocket: WebSocket
     ) -> str | None:
-        return await self._unsubscribe(
-            _graph_exec_channel_key(user_id, graph_exec_id=graph_exec_id), websocket
-        )
+        channel_key = graph_exec_channel_key(user_id, graph_exec_id=graph_exec_id)
+        return await self._close_subscription(user_id, websocket, channel_key)
 
     async def unsubscribe_graph_execs(
         self, *, user_id: str, graph_id: str, websocket: WebSocket
     ) -> str | None:
-        return await self._unsubscribe(
-            _graph_execs_channel_key(user_id, graph_id=graph_id), websocket
-        )
+        channel_key = _graph_execs_channel_key(user_id, graph_id=graph_id)
+        return await self._close_subscription(user_id, websocket, channel_key)
 
-    async def send_execution_update(
-        self, exec_event: GraphExecutionEvent | NodeExecutionEvent
-    ) -> int:
-        graph_exec_id = (
-            exec_event.id
-            if isinstance(exec_event, GraphExecutionEvent)
-            else exec_event.graph_exec_id
-        )
-
-        n_sent = 0
-
-        channels: set[str] = {
-            # Send update to listeners for this graph execution
-            _graph_exec_channel_key(exec_event.user_id, graph_exec_id=graph_exec_id)
-        }
-        if isinstance(exec_event, GraphExecutionEvent):
-            # Send update to listeners for all executions of this graph
-            channels.add(
-                _graph_execs_channel_key(
-                    exec_event.user_id, graph_id=exec_event.graph_id
+    async def _open_subscription(
+        self, user_id: str, websocket: WebSocket, channel_key: str, full_channel: str
+    ) -> None:
+        per_ws = self._ws_subs.setdefault(websocket, {})
+        if channel_key not in per_ws:
+            if len(per_ws) >= MAX_SUBSCRIPTIONS_PER_SOCKET:
+                raise ValueError(
+                    f"Subscription limit reached ({MAX_SUBSCRIPTIONS_PER_SOCKET} "
+                    "per connection)"
                 )
-            )
 
-        for channel in channels.intersection(self.subscriptions.keys()):
-            message = WSMessage(
-                method=_EVENT_TYPE_TO_METHOD_MAP[exec_event.event_type],
-                channel=channel,
-                data=exec_event.model_dump(),
-            ).model_dump_json()
-            for connection in self.subscriptions[channel]:
-                await connection.send_text(message)
-                n_sent += 1
+            async def on_message(data: Optional[bytes | str]) -> None:
+                await self._forward_exec_event(websocket, channel_key, data)
 
-        return n_sent
+            await self._subscribe(user_id, websocket, full_channel, on_message)
+            per_ws[channel_key] = full_channel
+        self.subscriptions.setdefault(channel_key, set()).add(websocket)
 
-    async def send_notification(
-        self, *, user_id: str, payload: NotificationPayload
-    ) -> int:
-        """Send a notification to all websocket connections belonging to a user."""
-        message = WSMessage(
-            method=WSMethod.NOTIFICATION,
-            data=payload.model_dump(),
-        ).model_dump_json()
-
-        connections = tuple(self.user_connections.get(user_id, set()))
-        if not connections:
-            return 0
-
-        await asyncio.gather(
-            *(connection.send_text(message) for connection in connections),
-            return_exceptions=True,
-        )
-
-        return len(connections)
-
-    async def _subscribe(self, channel_key: str, websocket: WebSocket) -> str:
-        if channel_key not in self.subscriptions:
-            self.subscriptions[channel_key] = set()
-        self.subscriptions[channel_key].add(websocket)
+    async def _close_subscription(
+        self, user_id: str, websocket: WebSocket, channel_key: str
+    ) -> str | None:
+        subscribers = self.subscriptions.get(channel_key)
+        if subscribers is None:
+            return None
+        subscribers.discard(websocket)
+        if not subscribers:
+            self.subscriptions.pop(channel_key, None)
+        full_channel = self._ws_subs.get(websocket, {}).pop(channel_key, None)
+        if full_channel is not None:
+            await self._unsubscribe(user_id, websocket, full_channel)
         return channel_key
 
-    async def _unsubscribe(self, channel_key: str, websocket: WebSocket) -> str | None:
-        if channel_key in self.subscriptions:
-            self.subscriptions[channel_key].discard(websocket)
-            if not self.subscriptions[channel_key]:
-                del self.subscriptions[channel_key]
-            return channel_key
-        return None
+    async def _subscribe(
+        self,
+        user_id: str,
+        websocket: WebSocket,
+        full_channel: str,
+        handler: MessageHandler,
+    ) -> None:
+        """SSUBSCRIBE on the socket's stream for the channel's shard, opening
+        that stream if this is the socket's first channel there."""
+        shard = redis.resolve_shard_for_channel(full_channel)
+        streams = self._ws_streams.setdefault(websocket, {})
+        stream = streams.get(shard)
+        if stream is None:
+            if not self._has_room(user_id, shard):
+                raise _StreamCapacityError("Server busy, try again later")
+
+            async def on_lost() -> None:
+                await self._close_for_lost_stream(websocket)
+
+            stream = streams[shard] = _ShardStream(on_lost)
+            self._streams_per_shard[shard] += 1
+            self._user_streams[(user_id, shard)] += 1
+        try:
+            await stream.add(full_channel, handler)
+        except BaseException:
+            if not stream.handlers and streams.pop(shard, None) is not None:
+                self._release_stream(user_id, shard)
+            raise
+
+    async def _unsubscribe(
+        self, user_id: str, websocket: WebSocket, full_channel: str
+    ) -> None:
+        streams = self._ws_streams.get(websocket, {})
+        for shard, stream in list(streams.items()):
+            if full_channel not in stream.handlers:
+                continue
+            await stream.remove(full_channel)
+            if not stream.handlers:
+                streams.pop(shard, None)
+                self._release_stream(user_id, shard)
+            return
+
+    async def _close_for_lost_stream(self, websocket: WebSocket) -> None:
+        """Close a socket whose events stopped arriving, so the client
+        reconnects, resubscribes and refetches what it missed."""
+        logger.warning("Closing WebSocket after its event stream was lost")
+        try:
+            await websocket.close(
+                code=WS_CLOSE_EVENT_STREAM_LOST, reason="Event stream interrupted"
+            )
+        except Exception as e:
+            if not _is_ws_close_race(e, websocket):
+                logger.warning("Failed to close WebSocket", exc_info=True)
+
+    async def _refuse(self, websocket: WebSocket, user_id: str) -> None:
+        # Accepted first, so the client gets 1013 rather than a failed handshake.
+        logger.warning(f"Refusing WebSocket for user #{user_id}: server busy")
+        try:
+            await websocket.accept()
+            await websocket.close(
+                code=WS_CLOSE_TRY_AGAIN_LATER, reason="Try again later"
+            )
+        except Exception as e:
+            if not _is_ws_close_race(e, websocket):
+                logger.warning("Failed to refuse WebSocket", exc_info=True)
+
+    def _a_shard_is_full(self, user_id: str) -> bool:
+        return any(not self._has_room(user_id, s) for s in self._streams_per_shard)
+
+    def _has_room(self, user_id: str, shard: Shard) -> bool:
+        held = self._streams_per_shard[shard]
+        if self._user_streams[(user_id, shard)] < STREAMS_PER_USER_SHARE:
+            return held < MAX_STREAMS_PER_SHARD
+        return held < MAX_STREAMS_PER_SHARD - MAX_STREAMS_PER_SHARD // 4
+
+    def _release_stream(self, user_id: str, shard: Shard) -> None:
+        self._streams_per_shard[shard] -= 1
+        if self._streams_per_shard[shard] <= 0:
+            del self._streams_per_shard[shard]
+        self._user_streams[(user_id, shard)] -= 1
+        if self._user_streams[(user_id, shard)] <= 0:
+            del self._user_streams[(user_id, shard)]
+
+    def _release_user_socket(self, user_id: str, websocket: WebSocket) -> None:
+        sockets = self._user_sockets.get(user_id)
+        if sockets is None:
+            return
+        sockets.discard(websocket)
+        if not sockets:
+            self._user_sockets.pop(user_id, None)
+
+    async def _forward_exec_event(
+        self,
+        websocket: WebSocket,
+        channel_key: str,
+        raw_payload: Optional[bytes | str],
+    ) -> None:
+        if raw_payload is None:
+            return
+        # Unwrap the `_EventPayloadWrapper` envelope, then re-wrap as a WS message.
+        try:
+            wrapper = (
+                raw_payload.decode()
+                if isinstance(raw_payload, (bytes, bytearray))
+                else raw_payload
+            )
+        except Exception:
+            logger.warning(
+                "Failed to decode pubsub payload on %s", channel_key, exc_info=True
+            )
+            return
+
+        try:
+            parsed = json.loads(wrapper)
+            event_data = parsed.get("payload")
+            if not isinstance(event_data, dict):
+                return
+            event_type = event_data.get("event_type")
+            method = _EVENT_TYPE_TO_METHOD_MAP.get(ExecutionEventType(event_type))
+            if method is None:
+                return
+            message = WSMessage(
+                method=method,
+                channel=channel_key,
+                data=event_data,
+            ).model_dump_json()
+            await websocket.send_text(message)
+        except Exception as e:
+            if _is_ws_close_race(e, websocket):
+                logger.debug("Dropped exec event on closed WS for %s", channel_key)
+                return
+            logger.exception("Failed to forward exec event on %s", channel_key)
+
+    async def _start_notification_subscription(
+        self, websocket: WebSocket, *, user_id: str
+    ) -> None:
+        full_channel = _notification_bus_channel(user_id)
+
+        async def on_message(data: Optional[bytes | str]) -> None:
+            await self._forward_notification(websocket, user_id, data)
+
+        try:
+            await self._subscribe(user_id, websocket, full_channel, on_message)
+        except _StreamCapacityError:
+            raise
+        except Exception:
+            logger.exception(f"Failed to open notification SSUBSCRIBE for {user_id}")
+            return
+        self._ws_notifications[websocket] = full_channel
+
+    async def _forward_notification(
+        self,
+        websocket: WebSocket,
+        user_id: str,
+        raw_payload: Optional[bytes | str],
+    ) -> None:
+        if raw_payload is None:
+            return
+        try:
+            wrapper_json = (
+                raw_payload.decode()
+                if isinstance(raw_payload, (bytes, bytearray))
+                else raw_payload
+            )
+            parsed = json.loads(wrapper_json)
+            inner = parsed.get("payload") if isinstance(parsed, dict) else None
+            if not isinstance(inner, dict):
+                return
+            event = NotificationEvent.model_validate(inner)
+        except Exception:
+            logger.warning(
+                "Failed to parse notification payload for user=%s",
+                user_id,
+                exc_info=True,
+            )
+            return
+        # Defense in depth against cross-user payloads.
+        if event.user_id != user_id:
+            return
+        message = WSMessage(
+            method=WSMethod.NOTIFICATION,
+            data=event.payload.model_dump(),
+        ).model_dump_json()
+        try:
+            await websocket.send_text(message)
+        except Exception as e:
+            if _is_ws_close_race(e, websocket):
+                logger.debug("Dropped notification on closed WS for user=%s", user_id)
+                return
+            logger.warning(
+                "Failed to deliver notification to WS for user=%s",
+                user_id,
+                exc_info=True,
+            )
 
 
-def _graph_exec_channel_key(user_id: str, *, graph_exec_id: str) -> str:
+class _ShardStream:
+    """One socket's SSUBSCRIBEs on one Redis shard, all over one connection."""
+
+    def __init__(self, on_lost: LostHandler) -> None:
+        # full channel → handler
+        self.handlers: dict[str, MessageHandler] = {}
+        self._on_lost = on_lost
+        self._client: AsyncRedis | None = None
+        self._pubsub: AsyncPubSub | None = None
+        self._task: asyncio.Task | None = None
+        # SUNSUBSCRIBEs sent per channel whose confirmation is still on its way
+        self._unsubscribing: Counter[str] = Counter()
+        self._stopping = False
+
+    async def add(self, channel: str, handler: MessageHandler) -> None:
+        _assert_no_wildcard(channel)
+        try:
+            pubsub = await asyncio.wait_for(
+                self._open_and_subscribe(channel), _STREAM_OPEN_TIMEOUT_S
+            )
+        except BaseException:
+            if not self.handlers:
+                await self._close_quietly()
+            raise
+        self.handlers[channel] = handler
+        if self._task is None:
+            self._task = asyncio.create_task(self._pump(pubsub))
+
+    async def _open_and_subscribe(self, channel: str) -> AsyncPubSub:
+        """``asyncio.wait_for`` bounds this whole call, not just opening the
+        connection — SSUBSCRIBE has no socket timeout of its own."""
+        pubsub = self._pubsub or await self._open(channel)
+        await pubsub.ssubscribe(channel)
+        return pubsub
+
+    async def remove(self, channel: str) -> None:
+        if self.handlers.pop(channel, None) is None:
+            return
+        if not self.handlers:
+            await self.stop()
+            return
+        if self._pubsub is None:
+            return
+        self._unsubscribing[channel] += 1
+        try:
+            await self._pubsub.sunsubscribe(channel)
+        except Exception:
+            # No confirmation is coming; a stale count would hide a real drop.
+            self._unsubscribing[channel] -= 1
+            if self._unsubscribing[channel] <= 0:
+                del self._unsubscribing[channel]
+            logger.warning(f"SUNSUBSCRIBE failed for {channel}", exc_info=True)
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
+        # Closing the connection drops every SSUBSCRIBE it carried.
+        await self._close_quietly()
+
+    async def _open(self, channel: str) -> AsyncPubSub:
+        self._client = await redis.connect_sharded_pubsub_async(channel)
+        self._pubsub = self._client.pubsub()
+        return self._pubsub
+
+    async def _close_quietly(self) -> None:
+        if self._pubsub is not None:
+            try:
+                await self._pubsub.aclose()
+            except Exception:
+                pass
+            self._pubsub = None
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
+
+    async def _pump(self, pubsub: AsyncPubSub) -> None:
+        try:
+            await self._forward(pubsub)
+        except asyncio.CancelledError:
+            raise
+        except (OSError, RedisError) as e:
+            logger.warning(f"Pubsub stream lost: {type(e).__name__}: {e}")
+        except Exception:
+            logger.exception("Pubsub pump crashed")
+        if not self._stopping:
+            await self._on_lost()
+
+    async def _forward(self, pubsub: AsyncPubSub) -> None:
+        async for message in pubsub.listen():
+            msg_type = message.get("type")
+            channel = message.get("channel")
+            if msg_type == "sunsubscribe":
+                if self._unsubscribing[channel] > 0:
+                    self._unsubscribing[channel] -= 1
+                    if self._unsubscribing[channel] <= 0:
+                        del self._unsubscribing[channel]
+                    continue
+                # Not ours: the slot moved and Redis dropped the subscription.
+                return
+            if msg_type != "smessage":
+                continue
+            handler = self.handlers.get(channel) if channel else None
+            if handler is None:
+                continue
+            try:
+                await handler(message.get("data"))
+            except Exception:
+                logger.exception(f"Websocket message-handler failed for {channel}")
+
+
+def graph_exec_channel_key(user_id: str, *, graph_exec_id: str) -> str:
     return f"{user_id}|graph_exec#{graph_exec_id}"
 
 

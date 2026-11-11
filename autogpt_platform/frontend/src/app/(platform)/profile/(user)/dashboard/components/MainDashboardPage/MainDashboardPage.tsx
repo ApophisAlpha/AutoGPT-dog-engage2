@@ -1,5 +1,5 @@
 import { useMainDashboardPage } from "./useMainDashboardPage";
-import { Separator } from "@/components/__legacy__/ui/separator";
+import { Separator } from "@/components/atoms/Separator/Separator";
 import { AgentTable } from "../AgentTable/AgentTable";
 import { PublishAgentModal } from "@/components/contextual/PublishAgentModal/PublishAgentModal";
 import { EditAgentModal } from "@/components/contextual/EditAgentModal/EditAgentModal";
@@ -32,19 +32,15 @@ export const MainDashboardPage = () => {
       <div className="mb-8 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
         <div className="space-y-6">
           <Text variant="h1" size="h3">
-            Agent dashboard
+            Workflow dashboard
           </Text>
           <div className="space-y-2">
-            <Text
-              variant="h2"
-              size="large-medium"
-              className="text-neutral-900 dark:text-neutral-100"
-            >
-              Submit a New Agent
+            <Text variant="h2" size="large-medium" tone="primary">
+              Submit a New Workflow
             </Text>
             <Text variant="body" size="small">
-              Select from the list of agents you currently have, or upload from
-              your local machine.
+              Select from the list of workflows you currently have, or upload
+              from your local machine.
             </Text>
           </div>
         </div>
@@ -57,7 +53,7 @@ export const MainDashboardPage = () => {
               size="small"
               onClick={onOpenSubmitModal}
             >
-              Submit agent
+              Submit workflow
             </Button>
           }
         />
@@ -67,12 +63,8 @@ export const MainDashboardPage = () => {
 
       {/* Agents Section */}
       <div>
-        <Text
-          variant="h2"
-          size="large-medium"
-          className="mb-4 text-neutral-900 dark:text-neutral-100"
-        >
-          Your uploaded agents
+        <Text variant="h2" size="large-medium" tone="primary" className="mb-4">
+          Your uploaded workflows
         </Text>
 
         {error ? (
@@ -81,26 +73,7 @@ export const MainDashboardPage = () => {
           <SubmissionsLoading />
         ) : submissions && submissions.submissions.length > 0 ? (
           <AgentTable
-            agents={submissions.submissions.map((submission, index) => ({
-              id: index,
-              agent_id: submission.agent_id,
-              agent_version: submission.agent_version,
-              sub_heading: submission.sub_heading,
-              agentName: submission.name,
-              description: submission.description,
-              imageSrc: submission.image_urls || [""],
-              dateSubmitted: submission.date_submitted,
-              status: submission.status,
-              runs: submission.runs,
-              rating: submission.rating,
-              video_url: submission.video_url || undefined,
-              categories: submission.categories,
-              slug: submission.slug,
-              store_listing_version_id:
-                submission.store_listing_version_id || undefined,
-              changes_summary: submission.changes_summary || undefined,
-              listing_id: submission.listing_id,
-            }))}
+            storeAgentSubmissions={submissions.submissions}
             onViewSubmission={onViewSubmission}
             onDeleteSubmission={onDeleteSubmission}
             onEditSubmission={onEditSubmission}

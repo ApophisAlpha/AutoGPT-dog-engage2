@@ -1,8 +1,15 @@
 import asyncio
 import logging
 from enum import Enum
-from typing import Any
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.fal._auth import (
     TEST_CREDENTIALS,
     TEST_CREDENTIALS_INPUT,
@@ -10,15 +17,11 @@ from backend.blocks.fal._auth import (
     FalCredentialsField,
     FalCredentialsInput,
 )
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
-)
+from backend.data.execution import ExecutionContext
 from backend.data.model import SchemaField
+from backend.util.file import store_media_file
 from backend.util.request import ClientResponseError, Requests
+from backend.util.type import MediaFileType
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +67,15 @@ class AIVideoGeneratorBlock(Block):
                 "credentials": TEST_CREDENTIALS_INPUT,
             },
             test_credentials=TEST_CREDENTIALS,
-            test_output=[("video_url", "https://fal.media/files/example/video.mp4")],
+            test_output=[
+                # Output will be a workspace ref or data URI depending on context
+                ("video_url", lambda x: x.startswith(("workspace://", "data:"))),
+            ],
             test_mock={
-                "generate_video": lambda *args, **kwargs: "https://fal.media/files/example/video.mp4"
+                # Use data URI to avoid HTTP requests during tests
+                "generate_video": lambda *args, **kwargs: "data:video/mp4;base64,AAAA"
             },
+            effect=BlockEffect.WORKSPACE,
         )
 
     def _get_headers(self, api_key: str) -> dict[str, str]:
@@ -76,28 +84,6 @@ class AIVideoGeneratorBlock(Block):
             "Authorization": f"Key {api_key}",
             "Content-Type": "application/json",
         }
-
-    async def _submit_request(
-        self, url: str, headers: dict[str, str], data: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Submit a request to the FAL API."""
-        try:
-            response = await Requests().post(url, headers=headers, json=data)
-            return response.json()
-        except ClientResponseError as e:
-            logger.error(f"FAL API request failed: {str(e)}")
-            raise RuntimeError(f"Failed to submit request: {str(e)}")
-
-    async def _poll_status(
-        self, status_url: str, headers: dict[str, str]
-    ) -> dict[str, Any]:
-        """Poll the status endpoint until completion or failure."""
-        try:
-            response = await Requests().get(status_url, headers=headers)
-            return response.json()
-        except ClientResponseError as e:
-            logger.error(f"Failed to get status: {str(e)}")
-            raise RuntimeError(f"Failed to get status: {str(e)}")
 
     async def generate_video(
         self, input_data: Input, credentials: FalCredentials
@@ -208,11 +194,22 @@ class AIVideoGeneratorBlock(Block):
             raise RuntimeError(f"API request failed: {str(e)}")
 
     async def run(
-        self, input_data: Input, *, credentials: FalCredentials, **kwargs
+        self,
+        input_data: Input,
+        *,
+        credentials: FalCredentials,
+        execution_context: ExecutionContext,
+        **kwargs,
     ) -> BlockOutput:
         try:
             video_url = await self.generate_video(input_data, credentials)
-            yield "video_url", video_url
+            # Store the generated video to the user's workspace for persistence
+            stored_url = await store_media_file(
+                file=MediaFileType(video_url),
+                execution_context=execution_context,
+                return_format="for_block_output",
+            )
+            yield "video_url", stored_url
         except Exception as e:
             error_message = str(e)
             yield "error", error_message

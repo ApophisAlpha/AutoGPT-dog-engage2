@@ -17,7 +17,7 @@ import asyncio
 import csv
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import prisma.enums
@@ -49,7 +49,7 @@ async def initialize_blocks(db: Prisma) -> set[str]:
 
     Returns a set of block IDs that exist in the database.
     """
-    from backend.data.block import get_blocks
+    from backend.blocks import get_blocks
 
     print("  Initializing agent blocks...")
     blocks = get_blocks()
@@ -179,7 +179,7 @@ async def create_user_and_profile(db: Prisma) -> None:
                 username=AUTOGPT_USERNAME,
                 description="Official AutoGPT agents and templates",
                 links=["https://agpt.co"],
-                avatarUrl="https://storage.googleapis.com/agpt-prod-website-artifacts/users/b3e41ea4-2f4c-4964-927c-fe682d857bad/images/4b5781a6-49e1-433c-9a75-65af1be5c02d.png",
+                avatarUrl="https://storage.googleapis.com/agpt-prod-public-site-media/users/b3e41ea4-2f4c-4964-927c-fe682d857bad/images/4b5781a6-49e1-433c-9a75-65af1be5c02d.png",
             )
         )
 
@@ -326,7 +326,6 @@ async def create_store_listing(
             id=listing_id,
             slug=metadata["slug"],
             agentGraphId=graph_id,
-            agentGraphVersion=graph_version,
             owningUserId=AUTOGPT_USER_ID,
             hasApprovedVersion=is_approved,
             useForOnboarding=metadata["use_for_onboarding"],
@@ -409,9 +408,11 @@ async def main():
             agent_name = metadata["agent_name"]
             print(f"\nProcessing: {agent_name}")
 
-            # Use a transaction per agent to prevent dangling resources
+            # Use a transaction per agent to prevent dangling resources.
+            # Generous timeout: large multi-graph agents exceed the 5s default
+            # when the DB is remote (e.g. seeding a preview env on Cloud SQL).
             try:
-                async with db.tx() as tx:
+                async with db.tx(timeout=timedelta(minutes=5)) as tx:
                     # Load and create the agent graph
                     agent_data = await load_agent_json(json_file)
                     graph_id, graph_version = await create_agent_graph(

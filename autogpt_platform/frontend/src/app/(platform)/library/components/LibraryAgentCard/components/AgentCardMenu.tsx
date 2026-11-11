@@ -5,6 +5,10 @@ import {
   useDeleteV2DeleteLibraryAgent,
   usePostV2ForkLibraryAgent,
 } from "@/app/api/__generated__/endpoints/library/library";
+import {
+  usePostV2BulkMoveAgents,
+  getGetV2ListLibraryFoldersQueryKey,
+} from "@/app/api/__generated__/endpoints/folders/folders";
 import { LibraryAgent } from "@/app/api/__generated__/models/libraryAgent";
 import { Button } from "@/components/atoms/Button/Button";
 import { Text } from "@/components/atoms/Text/Text";
@@ -17,11 +21,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/molecules/DropdownMenu/DropdownMenu";
 import { useToast } from "@/components/molecules/Toast/use-toast";
-import { DotsThree } from "@phosphor-icons/react";
 import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
+import { MoveToFolderDialog } from "../../MoveToFolderDialog/MoveToFolderDialog";
+import { MoreHorizontalIcon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
 
 interface AgentCardMenuProps {
   agent: LibraryAgent;
@@ -32,11 +38,25 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
   const queryClient = useQueryClient();
   const router = useRouter();
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [showMoveDialog, setShowMoveDialog] = useState(false);
   const [isDeletingAgent, setIsDeletingAgent] = useState(false);
   const [isDuplicatingAgent, setIsDuplicatingAgent] = useState(false);
+  const [isRemovingFromFolder, setIsRemovingFromFolder] = useState(false);
 
   const { mutateAsync: deleteAgent } = useDeleteV2DeleteLibraryAgent();
   const { mutateAsync: forkAgent } = usePostV2ForkLibraryAgent();
+  const { mutateAsync: bulkMoveAgents } = usePostV2BulkMoveAgents({
+    mutation: {
+      onSuccess: () => {
+        queryClient.invalidateQueries({
+          queryKey: getGetV2ListLibraryAgentsQueryKey(),
+        });
+        queryClient.invalidateQueries({
+          queryKey: getGetV2ListLibraryFoldersQueryKey(),
+        });
+      },
+    },
+  });
 
   async function handleDuplicateAgent() {
     if (!agent.id) return;
@@ -52,13 +72,13 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
         });
 
         toast({
-          title: "Agent duplicated",
+          title: "Workflow duplicated",
           description: `${result.data.name} has been created.`,
         });
       }
     } catch (error: unknown) {
       toast({
-        title: "Failed to duplicate agent",
+        title: "Failed to duplicate workflow",
         description:
           error instanceof Error
             ? error.message
@@ -67,6 +87,37 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
       });
     } finally {
       setIsDuplicatingAgent(false);
+    }
+  }
+
+  async function handleRemoveFromFolder() {
+    if (!agent.id) return;
+
+    setIsRemovingFromFolder(true);
+
+    try {
+      await bulkMoveAgents({
+        data: {
+          agent_ids: [agent.id],
+          folder_id: null,
+        },
+      });
+
+      toast({
+        title: "Removed from folder",
+        description: "Workflow has been moved back to your library.",
+      });
+    } catch (error: unknown) {
+      toast({
+        title: "Failed to remove from folder",
+        description:
+          error instanceof Error
+            ? error.message
+            : "An unexpected error occurred.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsRemovingFromFolder(false);
     }
   }
 
@@ -82,12 +133,12 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
         queryKey: getGetV2ListLibraryAgentsQueryKey(),
       });
 
-      toast({ title: "Agent deleted" });
+      toast({ title: "Workflow deleted" });
       setShowDeleteDialog(false);
       router.push("/library");
     } catch (error: unknown) {
       toast({
-        title: "Failed to delete agent",
+        title: "Failed to delete workflow",
         description:
           error instanceof Error
             ? error.message
@@ -104,11 +155,11 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button
-            className="absolute right-2 top-1 rounded p-1.5 transition-opacity hover:bg-neutral-100"
+            className="absolute top-1 right-2 rounded p-1.5 text-foreground-secondary transition-opacity hover:bg-surface-hover"
             onClick={(e) => e.stopPropagation()}
             aria-label="More actions"
           >
-            <DotsThree className="h-5 w-5 text-neutral-600" />
+            <Icon icon={MoreHorizontalIcon} className="h-5 w-5" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
@@ -119,9 +170,10 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
                   href={`/build?flowID=${agent.graph_id}&flowVersion=${agent.graph_version}`}
                   target="_blank"
                   className="flex items-center gap-2"
+                  data-testid="library-agent-card-open-in-builder-link"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  Edit agent
+                  Edit workflow
                 </Link>
               </DropdownMenuItem>
               <DropdownMenuSeparator />
@@ -133,19 +185,42 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
               handleDuplicateAgent();
             }}
             disabled={isDuplicatingAgent}
-            className="flex items-center gap-2"
           >
-            Duplicate agent
+            Duplicate workflow
           </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowMoveDialog(true);
+            }}
+          >
+            Move to folder
+          </DropdownMenuItem>
+          {agent.folder_id && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleRemoveFromFolder();
+                }}
+                disabled={isRemovingFromFolder}
+              >
+                Remove from folder
+              </DropdownMenuItem>
+            </>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem
             onClick={(e) => {
               e.stopPropagation();
               setShowDeleteDialog(true);
             }}
-            className="flex items-center gap-2 text-red-600 focus:bg-red-50 focus:text-red-600"
+            // oxlint-disable-next-line design-system/no-restyle -- DropdownMenuItem has no destructive variant
+            className="text-error-foreground focus:bg-error-surface focus:text-error-foreground"
           >
-            Delete agent
+            Delete workflow
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -156,13 +231,13 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
           set: setShowDeleteDialog,
         }}
         styling={{ maxWidth: "32rem" }}
-        title="Delete agent"
+        title="Delete workflow"
       >
         <Dialog.Content>
           <div>
             <Text variant="large">
-              Are you sure you want to delete this agent? This action cannot be
-              undone.
+              Are you sure you want to delete this workflow? This action cannot
+              be undone.
             </Text>
             <Dialog.Footer>
               <Button
@@ -177,12 +252,20 @@ export function AgentCardMenu({ agent }: AgentCardMenuProps) {
                 onClick={handleDeleteAgent}
                 loading={isDeletingAgent}
               >
-                Delete Agent
+                Delete Workflow
               </Button>
             </Dialog.Footer>
           </div>
         </Dialog.Content>
       </Dialog>
+
+      <MoveToFolderDialog
+        agentId={agent.id}
+        agentName={agent.name}
+        currentFolderId={agent.folder_id}
+        isOpen={showMoveDialog}
+        setIsOpen={setShowMoveDialog}
+      />
     </>
   );
 }

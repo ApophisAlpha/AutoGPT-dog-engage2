@@ -1,7 +1,16 @@
+from datetime import datetime, timezone
+
 import pytest
+from prisma.models import User as PrismaUser
 from pydantic import SecretStr
 
-from backend.data.model import HostScopedCredentials
+from backend.data.credential_scope import ServerTarget
+from backend.data.model import (
+    HostScopedCredentials,
+    NodeExecutionStats,
+    User,
+    UserPasswordCredentials,
+)
 
 
 class TestHostScopedCredentials:
@@ -79,9 +88,22 @@ class TestHostScopedCredentials:
             headers={"Authorization": SecretStr("Bearer token")},
         )
 
-        assert creds.matches_url("http://localhost:8080/api/v1")
+        # Non-standard ports require explicit port in credential host
+        assert not creds.matches_url("http://localhost:8080/api/v1")
         assert creds.matches_url("https://localhost:443/secure/endpoint")
         assert creds.matches_url("http://localhost/simple")
+
+    def test_matches_url_with_explicit_port(self):
+        """Test URL matching with explicit port in credential host."""
+        creds = HostScopedCredentials(
+            provider="custom",
+            host="localhost:8080",
+            headers={"Authorization": SecretStr("Bearer token")},
+        )
+
+        assert creds.matches_url("http://localhost:8080/api/v1")
+        assert not creds.matches_url("http://localhost:3000/api/v1")
+        assert not creds.matches_url("http://localhost/simple")
 
     def test_empty_headers_dict(self):
         """Test HostScopedCredentials with empty headers."""
@@ -128,8 +150,20 @@ class TestHostScopedCredentials:
             ("*.example.com", "https://sub.api.example.com/test", True),
             ("*.example.com", "https://example.com/test", True),
             ("*.example.com", "https://example.org/test", False),
-            ("localhost", "http://localhost:3000/test", True),
+            # Non-standard ports require explicit port in credential host
+            ("localhost", "http://localhost:3000/test", False),
+            ("localhost:3000", "http://localhost:3000/test", True),
             ("localhost", "http://127.0.0.1:3000/test", False),
+            # IPv6 addresses (frontend stores with brackets via URL.hostname)
+            ("[::1]", "http://[::1]/test", True),
+            ("[::1]", "http://[::1]:80/test", True),
+            ("[::1]", "https://[::1]:443/test", True),
+            ("[::1]", "http://[::1]:8080/test", False),  # Non-standard port
+            ("[::1]:8080", "http://[::1]:8080/test", True),
+            ("[::1]:8080", "http://[::1]:9090/test", False),
+            ("[2001:db8::1]", "http://[2001:db8::1]/path", True),
+            ("[2001:db8::1]", "https://[2001:db8::1]:443/path", True),
+            ("[2001:db8::1]", "http://[2001:db8::ff]/path", False),
         ],
     )
     def test_url_matching_parametrized(self, host: str, test_url: str, expected: bool):
@@ -141,3 +175,205 @@ class TestHostScopedCredentials:
         )
 
         assert creds.matches_url(test_url) == expected
+
+
+class TestUserPasswordCredentialsScope:
+    @pytest.mark.parametrize(
+        "provider,scope,target,expected",
+        [
+            (
+                "smtp",
+                "smtp://smtp.example.com",
+                ("smtp", "smtp.example.com", 587),
+                True,
+            ),
+            ("smtp", "smtp://smtp.example.com", ("smtp", "203.0.113.7", 587), False),
+            # The rule is the provider's: a database scope on an SMTP login,
+            # or an SMTP scope on a database login, matches nothing
+            (
+                "smtp",
+                "postgresql://db.example.com",
+                ("postgresql", "db.example.com", 5432),
+                False,
+            ),
+            (
+                "database",
+                "smtp://smtp.example.com",
+                ("smtp", "smtp.example.com", 587),
+                False,
+            ),
+            # A login with no scope, or a provider with no scope rule, matches nothing
+            ("smtp", None, ("smtp", "smtp.example.com", 587), False),
+            (
+                "webshare_proxy",
+                "smtp://smtp.example.com",
+                ("smtp", "smtp.example.com", 587),
+                False,
+            ),
+        ],
+    )
+    def test_matches_scope(
+        self,
+        provider: str,
+        scope: str | None,
+        target: tuple[str, str, int],
+        expected: bool,
+    ):
+        creds = UserPasswordCredentials(
+            provider=provider,
+            username=SecretStr("user"),
+            password=SecretStr("pass"),
+            scope=scope,
+        )
+        scheme, host, port = target
+        assert (
+            creds.matches_scope(ServerTarget(scheme=scheme, host=host, port=port))
+            is expected
+        )
+
+    def test_scope_survives_storage_round_trip(self):
+        creds = UserPasswordCredentials(
+            provider="database",
+            username=SecretStr("user"),
+            password=SecretStr("pass"),
+            scope="postgresql://db.example.com:5432",
+        )
+        restored = UserPasswordCredentials.model_validate(creds.model_dump())
+        assert restored.scope == "postgresql://db.example.com:5432"
+
+    def test_login_saved_before_scopes_loads_without_one(self):
+        restored = UserPasswordCredentials.model_validate(
+            {"provider": "smtp", "username": "user", "password": "pass"}
+        )
+        assert restored.scope is None
+
+
+class TestNodeExecutionStatsIadd:
+    def test_adds_numeric_fields(self):
+        a = NodeExecutionStats(input_token_count=100, output_token_count=50)
+        b = NodeExecutionStats(input_token_count=200, output_token_count=30)
+        a += b
+        assert a.input_token_count == 300
+        assert a.output_token_count == 80
+
+    def test_none_does_not_overwrite(self):
+        a = NodeExecutionStats(provider_cost=0.5, error="some error")
+        b = NodeExecutionStats(provider_cost=None, error=None)
+        a += b
+        assert a.provider_cost == 0.5
+        assert a.error == "some error"
+
+    def test_none_is_skipped_preserving_existing_value(self):
+        a = NodeExecutionStats(input_token_count=100)
+        b = NodeExecutionStats()
+        a += b
+        assert a.input_token_count == 100
+
+    def test_dict_fields_are_merged(self):
+        a = NodeExecutionStats(
+            cleared_inputs={"field1": ["val1"]},
+        )
+        b = NodeExecutionStats(
+            cleared_inputs={"field2": ["val2"]},
+        )
+        a += b
+        assert a.cleared_inputs == {"field1": ["val1"], "field2": ["val2"]}
+
+    def test_returns_self(self):
+        a = NodeExecutionStats()
+        b = NodeExecutionStats(input_token_count=10)
+        result = a.__iadd__(b)
+        assert result is a
+
+    def test_not_implemented_for_non_stats(self):
+        a = NodeExecutionStats()
+        result = a.__iadd__("not a stats")  # type: ignore[arg-type]
+        assert result is NotImplemented
+
+    def test_error_none_does_not_clear_existing_error(self):
+        a = NodeExecutionStats(error="existing error")
+        b = NodeExecutionStats(error=None)
+        a += b
+        assert a.error == "existing error"
+
+    def test_provider_cost_none_does_not_clear_existing_cost(self):
+        a = NodeExecutionStats(provider_cost=0.05)
+        b = NodeExecutionStats(provider_cost=None)
+        a += b
+        assert a.provider_cost == 0.05
+
+    def test_provider_cost_accumulates_when_both_set(self):
+        a = NodeExecutionStats(provider_cost=0.01)
+        b = NodeExecutionStats(provider_cost=0.02)
+        a += b
+        assert abs((a.provider_cost or 0) - 0.03) < 1e-9
+
+    def test_provider_cost_first_write_from_none(self):
+        a = NodeExecutionStats()
+        b = NodeExecutionStats(provider_cost=0.05)
+        a += b
+        assert a.provider_cost == 0.05
+
+    def test_provider_cost_type_first_write_from_none(self):
+        """Writing provider_cost_type into a stats with None sets it."""
+        a = NodeExecutionStats()
+        b = NodeExecutionStats(provider_cost_type="characters")
+        a += b
+        assert a.provider_cost_type == "characters"
+
+    def test_provider_cost_type_none_does_not_overwrite(self):
+        """A None provider_cost_type from other must not clear an existing value."""
+        a = NodeExecutionStats(provider_cost_type="tokens")
+        b = NodeExecutionStats()
+        a += b
+        assert a.provider_cost_type == "tokens"
+
+
+class TestUserFromDbConsent:
+    @staticmethod
+    def _row(**consent: datetime | str | None) -> PrismaUser:
+        now = datetime(2026, 10, 2, tzinfo=timezone.utc)
+        return PrismaUser.model_validate(
+            {
+                "id": "user-1",
+                "email": "user@example.com",
+                "emailVerified": True,
+                "createdAt": now,
+                "updatedAt": now,
+                "metadata": "{}",
+                "integrations": "",
+                "maxEmailsPerDay": 3,
+                "briefingFrequency": "WEEKLY",
+                "alertsEnabled": True,
+                "notifyOnStoreVerdict": True,
+                "timezone": "not-set",
+                "subscriptionTier": "NO_TIER",
+                **consent,
+            }
+        )
+
+    def test_maps_the_consent_fields(self):
+        accepted_at = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+        opted_out_at = datetime(2026, 10, 2, 12, 1, tzinfo=timezone.utc)
+
+        user = User.from_db(
+            self._row(
+                termsAcceptedAt=accepted_at,
+                termsVersion="2026-10",
+                marketingOptOutAt=opted_out_at,
+                marketingOptOutSource="signup",
+            )
+        )
+
+        assert user.terms_accepted_at == accepted_at
+        assert user.terms_version == "2026-10"
+        assert user.marketing_opt_out_at == opted_out_at
+        assert user.marketing_opt_out_source == "signup"
+
+    def test_an_account_without_consent_maps_to_none(self):
+        user = User.from_db(self._row())
+
+        assert user.terms_accepted_at is None
+        assert user.terms_version is None
+        assert user.marketing_opt_out_at is None
+        assert user.marketing_opt_out_source is None

@@ -3,17 +3,18 @@ from urllib.parse import quote
 
 from typing_extensions import TypedDict
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.jina._auth import (
     JinaCredentials,
     JinaCredentialsField,
     JinaCredentialsInput,
-)
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
 )
 from backend.data.model import SchemaField
 from backend.util.request import Requests
@@ -50,6 +51,7 @@ class FactCheckerBlock(Block):
             categories={BlockCategory.SEARCH},
             input_schema=FactCheckerBlock.Input,
             output_schema=FactCheckerBlock.Output,
+            effect=BlockEffect.READ,
         )
 
     async def run(

@@ -17,9 +17,10 @@ This module provides:
 from pydantic import BaseModel, Field, SecretStr
 
 # === CORE BLOCK SYSTEM ===
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockManualWebhookConfig,
     BlockOutput,
     BlockSchema,
@@ -28,6 +29,7 @@ from backend.data.block import (
     BlockType,
     BlockWebhookConfig,
 )
+from backend.blocks._preview import ChangePreview, PreviewField, PreviewTable
 from backend.data.integrations import Webhook, update_webhook
 from backend.data.model import APIKeyCredentials, Credentials, CredentialsField
 from backend.data.model import CredentialsMetaInput as _CredentialsMetaInput
@@ -65,7 +67,7 @@ except ImportError:
 
 # Cost System
 try:
-    from backend.data.block import BlockCost, BlockCostType
+    from backend.blocks._base import BlockCost, BlockCostType
 except ImportError:
     from backend.data.block_cost_config import BlockCost, BlockCostType
 
@@ -104,9 +106,10 @@ except ImportError:
 
 # OAuth handlers
 try:
-    from backend.integrations.oauth.base import BaseOAuthHandler
+    from backend.integrations.oauth.base import BaseOAuthHandler, parse_granted_scopes
 except ImportError:
     BaseOAuthHandler = None
+    parse_granted_scopes = None
 
 
 # Credential type with proper provider name
@@ -122,6 +125,7 @@ __all__ = [
     # Core Block System
     "Block",
     "BlockCategory",
+    "BlockEffect",
     "BlockOutput",
     "BlockSchema",
     "BlockSchemaInput",
@@ -129,6 +133,9 @@ __all__ = [
     "BlockType",
     "BlockWebhookConfig",
     "BlockManualWebhookConfig",
+    "ChangePreview",
+    "PreviewField",
+    "PreviewTable",
     # Schema and Model Components
     "SchemaField",
     "Credentials",
@@ -151,6 +158,7 @@ __all__ = [
     "update_webhook",
     # Provider-Specific (when available)
     "BaseOAuthHandler",
+    "parse_granted_scopes",
     # Utilities
     "json",
     "store_media_file",

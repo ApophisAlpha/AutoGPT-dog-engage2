@@ -1,6 +1,14 @@
 from todoist_api_python.api import TodoistAPI
 from typing_extensions import Optional
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.todoist._auth import (
     TEST_CREDENTIALS,
     TEST_CREDENTIALS_INPUT,
@@ -10,13 +18,6 @@ from backend.blocks.todoist._auth import (
     TodoistCredentialsInput,
 )
 from backend.blocks.todoist._types import Colors
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
-)
 from backend.data.model import SchemaField
 
 
@@ -76,6 +77,7 @@ class TodoistListProjectsBlock(Block):
                     None,
                 )
             },
+            effect=BlockEffect.READ,
         )
 
     @staticmethod
@@ -161,6 +163,7 @@ class TodoistCreateProjectBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("success", True)],
             test_mock={"create_project": lambda *args, **kwargs: (True)},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod
@@ -267,6 +270,7 @@ class TodoistGetProjectBlock(Block):
                     },
                 )
             },
+            effect=BlockEffect.READ,
         )
 
     @staticmethod
@@ -347,6 +351,7 @@ class TodoistUpdateProjectBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("success", True)],
             test_mock={"update_project": lambda *args, **kwargs: (True)},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod
@@ -427,6 +432,8 @@ class TodoistDeleteProjectBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("success", True)],
             test_mock={"delete_project": lambda *args, **kwargs: (True)},
+            is_irreversible_action=True,
+            effect=BlockEffect.EXTERNAL,
         )
 
     @staticmethod
@@ -524,6 +531,7 @@ class TodoistListCollaboratorsBlock(Block):
                     ],
                 )
             },
+            effect=BlockEffect.READ,
         )
 
     @staticmethod

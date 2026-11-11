@@ -14,6 +14,10 @@ import {
 import { Dialog } from "@/components/molecules/Dialog/Dialog";
 import { useEffect, useRef, useState } from "react";
 import { ScheduleAgentModal } from "../ScheduleAgentModal/ScheduleAgentModal";
+import {
+  AIAgentSafetyPopup,
+  useAIAgentSafetyPopup,
+} from "./components/AIAgentSafetyPopup/AIAgentSafetyPopup";
 import { ModalHeader } from "./components/ModalHeader/ModalHeader";
 import { ModalRunSection } from "./components/ModalRunSection/ModalRunSection";
 import { RunActions } from "./components/RunActions/RunActions";
@@ -24,20 +28,28 @@ interface Props {
   triggerSlot: React.ReactNode;
   agent: LibraryAgent;
   initialInputValues?: Record<string, any>;
+  initialTriggerConfigValues?: Record<string, any>;
   initialInputCredentials?: Record<string, any>;
   onRunCreated?: (execution: GraphExecutionMeta) => void;
   onTriggerSetup?: (preset: LibraryAgentPreset) => void;
   onScheduleCreated?: (schedule: GraphExecutionJobInfo) => void;
+  /** Hosts that call agents something else (the expert page's workflows)
+   *  override the dialog title. */
+  title?: string;
+  dialogVariant?: "default" | "compact";
 }
 
 export function RunAgentModal({
   triggerSlot,
   agent,
   initialInputValues,
+  initialTriggerConfigValues,
   initialInputCredentials,
   onRunCreated,
   onTriggerSetup,
   onScheduleCreated,
+  title = "Run Workflow",
+  dialogVariant = "default",
 }: Props) {
   const {
     // UI state
@@ -50,6 +62,11 @@ export function RunAgentModal({
     // Form: regular inputs
     inputValues,
     setInputValues,
+
+    // Form: trigger config (the trigger node's config on a triggered agent)
+    triggerConfigValues,
+    setTriggerConfigValues,
+    triggerConfigFields,
 
     // Form: credentials
     inputCredentials,
@@ -67,6 +84,7 @@ export function RunAgentModal({
     // Schemas
     agentInputFields,
     agentCredentialsInputFields,
+    hasInputFields,
 
     // Async states
     isExecuting,
@@ -74,20 +92,31 @@ export function RunAgentModal({
 
     // Actions
     handleRun,
+    handleSimulate,
   } = useAgentRunModal(agent, {
     onRun: onRunCreated,
     onSetupTrigger: onTriggerSetup,
     initialInputValues,
+    initialTriggerConfigValues,
     initialInputCredentials,
   });
 
   const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
   const [hasOverflow, setHasOverflow] = useState(false);
+  const [isSafetyPopupOpen, setIsSafetyPopupOpen] = useState(false);
+  const [pendingRunAction, setPendingRunAction] = useState<(() => void) | null>(
+    null,
+  );
   const contentRef = useRef<HTMLDivElement>(null);
 
+  const { shouldShowPopup, dismissPopup } = useAIAgentSafetyPopup(
+    agent.id,
+    agent.has_sensitive_action,
+    agent.has_human_in_the_loop,
+  );
+
   const hasAnySetupFields =
-    Object.keys(agentInputFields || {}).length > 0 ||
-    Object.keys(agentCredentialsInputFields || {}).length > 0;
+    hasInputFields || Object.keys(agentCredentialsInputFields || {}).length > 0;
 
   const isTriggerRunType = defaultRunType.includes("trigger");
 
@@ -135,6 +164,13 @@ export function RunAgentModal({
     }));
   }
 
+  function handleTriggerConfigChange(key: string, value: string) {
+    setTriggerConfigValues((prev) => ({
+      ...prev,
+      [key]: value,
+    }));
+  }
+
   function handleCredentialsChange(key: string, value: any | undefined) {
     setInputCredentials((prev) => {
       const next = { ...prev } as Record<string, any>;
@@ -165,9 +201,29 @@ export function RunAgentModal({
     onScheduleCreated?.(schedule);
   }
 
+  function handleRunWithSafetyCheck() {
+    if (shouldShowPopup) {
+      setPendingRunAction(() => handleRun);
+      setIsSafetyPopupOpen(true);
+    } else {
+      handleRun();
+    }
+  }
+
+  function handleSafetyPopupAcknowledge() {
+    setIsSafetyPopupOpen(false);
+    dismissPopup();
+    if (pendingRunAction) {
+      pendingRunAction();
+      setPendingRunAction(null);
+    }
+  }
+
   return (
     <>
       <Dialog
+        title={title}
+        variant={dialogVariant}
         controlled={{ isOpen, set: handleSetOpen }}
         styling={{ maxWidth: "600px", maxHeight: "90vh" }}
       >
@@ -180,7 +236,7 @@ export function RunAgentModal({
 
               {/* Content */}
               {hasAnySetupFields ? (
-                <div className="mt-10 pb-32">
+                <div className="mt-4 pb-10">
                   <RunAgentModalContextProvider
                     value={{
                       agent,
@@ -192,6 +248,9 @@ export function RunAgentModal({
                       inputValues,
                       setInputValue: handleInputChange,
                       agentInputFields,
+                      triggerConfigValues,
+                      setTriggerConfigValue: handleTriggerConfigChange,
+                      triggerConfigFields,
                       inputCredentials,
                       setInputCredentialsValue: handleCredentialsChange,
                       agentCredentialsInputFields,
@@ -204,54 +263,59 @@ export function RunAgentModal({
             </div>
 
             <Dialog.Footer
-              className={`sticky bottom-0 z-10 bg-white pt-4 ${
+              // oxlint-disable-next-line design-system/no-restyle -- a sticky footer over scrolling content needs its own fill and gap
+              className={`sticky bottom-0 z-10 bg-surface pt-4 ${
                 hasOverflow
-                  ? "border-t border-neutral-100 shadow-[0_-2px_8px_rgba(0,0,0,0.04)]"
+                  ? // oxlint-disable-next-line design-system/no-restyle, design-system/no-arbitrary-values -- the overflow divider and its soft top shadow have no Dialog.Footer variant or shadow token
+                    "border-t border-separator shadow-[0_-2px_8px_rgba(0,0,0,0.04)]"
                   : ""
               }`}
             >
               <div className="flex items-center justify-end gap-3">
-                {isTriggerRunType ? null : !allRequiredInputsAreSet ? (
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <span>
-                          <Button
-                            variant="secondary"
-                            onClick={handleOpenScheduleModal}
-                            disabled={
-                              isExecuting ||
-                              isSettingUpTrigger ||
-                              !allRequiredInputsAreSet
-                            }
-                          >
-                            Schedule Task
-                          </Button>
-                        </span>
-                      </TooltipTrigger>
-                      <TooltipContent>
-                        <p>
-                          Please set up all required inputs and credentials
-                          before scheduling
-                        </p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                ) : (
-                  <Button
-                    variant="secondary"
-                    onClick={handleOpenScheduleModal}
-                    disabled={isExecuting || isSettingUpTrigger}
-                  >
-                    Schedule Task
-                  </Button>
-                )}
                 <RunActions
                   defaultRunType={defaultRunType}
-                  onRun={handleRun}
+                  onRun={handleRunWithSafetyCheck}
+                  onSimulate={handleSimulate}
                   isExecuting={isExecuting}
                   isSettingUpTrigger={isSettingUpTrigger}
                   isRunReady={allRequiredInputsAreSet}
+                  scheduleButton={
+                    isTriggerRunType ? undefined : !allRequiredInputsAreSet ? (
+                      <TooltipProvider>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span>
+                              <Button
+                                variant="secondary"
+                                onClick={handleOpenScheduleModal}
+                                disabled={
+                                  isExecuting ||
+                                  isSettingUpTrigger ||
+                                  !allRequiredInputsAreSet
+                                }
+                              >
+                                Schedule Task
+                              </Button>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>
+                              Please set up all required inputs and credentials
+                              before scheduling
+                            </p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    ) : (
+                      <Button
+                        variant="secondary"
+                        onClick={handleOpenScheduleModal}
+                        disabled={isExecuting || isSettingUpTrigger}
+                      >
+                        Schedule Task
+                      </Button>
+                    )
+                  }
                 />
               </div>
               <ScheduleAgentModal
@@ -266,6 +330,12 @@ export function RunAgentModal({
           </div>
         </Dialog.Content>
       </Dialog>
+
+      <AIAgentSafetyPopup
+        agentId={agent.id}
+        isOpen={isSafetyPopupOpen}
+        onAcknowledge={handleSafetyPopupAcknowledge}
+      />
     </>
   );
 }

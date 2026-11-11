@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 # Cache configuration
 CACHE_KEY_PREFIX = "understanding"
 CACHE_TTL_SECONDS = 48 * 60 * 60  # 48 hours
+# Left in the cache by a forget, so a read that fetched the row before it cannot cache it again.
+FORGOTTEN_MARKER = "forgotten"
 
 
 def _cache_key(user_id: str) -> str:
@@ -23,12 +25,49 @@ def _cache_key(user_id: str) -> str:
 
 
 def _json_to_list(value: Any) -> list[str]:
-    """Convert Json field to list[str], handling None."""
+    """Convert Json field to list[str], handling None.
+
+    Also handles legacy dict-format rows (e.g. ``{"Learn": [...], "Create": [...]}``
+    from the reverted themed-prompts feature) by flattening all values into a single
+    list so existing personalised data isn't silently lost.
+    """
     if value is None:
         return []
     if isinstance(value, list):
         return cast(list[str], value)
+    if isinstance(value, dict):
+        # Legacy themed-prompt format: flatten all string values from all categories.
+        logger.debug(
+            "_json_to_list: flattening legacy dict-format value (keys=%s)",
+            list(value.keys()),
+        )
+        return [
+            item
+            for vals in value.values()
+            if isinstance(vals, list)
+            for item in vals
+            if isinstance(item, str)
+        ]
     return []
+
+
+def _json_to_themed_prompts(value: Any) -> dict[str, list[str]]:
+    """Convert Json field to themed prompts dict.
+
+    Handles both the new ``dict[str, list[str]]`` format and the legacy
+    ``list[str]`` format.  Legacy rows are placed under a ``"General"`` key so
+    existing personalised prompts remain readable until a backfill regenerates
+    them into the proper themed shape.
+    """
+    if isinstance(value, dict):
+        return {
+            k: [i for i in v if isinstance(i, str)]
+            for k, v in value.items()
+            if isinstance(k, str) and isinstance(v, list)
+        }
+    if isinstance(value, list) and value:
+        return {"General": [str(p) for p in value if isinstance(p, str)]}
+    return {}
 
 
 class BusinessUnderstandingInput(pydantic.BaseModel):
@@ -86,6 +125,11 @@ class BusinessUnderstandingInput(pydantic.BaseModel):
         None, description="Any additional context"
     )
 
+    # Suggested prompts (UI-only, not included in system prompt)
+    suggested_prompts: Optional[dict[str, list[str]]] = pydantic.Field(
+        None, description="LLM-generated suggested prompts grouped by theme"
+    )
+
 
 class BusinessUnderstanding(pydantic.BaseModel):
     """Full business understanding model returned from database."""
@@ -122,6 +166,9 @@ class BusinessUnderstanding(pydantic.BaseModel):
     # Additional context
     additional_notes: Optional[str] = None
 
+    # Suggested prompts (UI-only, not included in system prompt)
+    suggested_prompts: dict[str, list[str]] = pydantic.Field(default_factory=dict)
+
     @classmethod
     def from_db(cls, db_record: CoPilotUnderstanding) -> "BusinessUnderstanding":
         """Convert database record to Pydantic model."""
@@ -149,6 +196,7 @@ class BusinessUnderstanding(pydantic.BaseModel):
             current_software=_json_to_list(business.get("current_software")),
             existing_automation=_json_to_list(business.get("existing_automation")),
             additional_notes=business.get("additional_notes"),
+            suggested_prompts=_json_to_themed_prompts(data.get("suggested_prompts")),
         )
 
 
@@ -171,7 +219,7 @@ async def _get_from_cache(user_id: str) -> Optional[BusinessUnderstanding]:
     try:
         redis = await get_redis_async()
         cached_data = await redis.get(_cache_key(user_id))
-        if cached_data:
+        if cached_data and cached_data != FORGOTTEN_MARKER:
             return BusinessUnderstanding.model_validate_json(cached_data)
     except Exception as e:
         logger.warning(f"Failed to get understanding from cache: {e}")
@@ -191,13 +239,18 @@ async def _set_cache(user_id: str, understanding: BusinessUnderstanding) -> None
         logger.warning(f"Failed to set understanding in cache: {e}")
 
 
-async def _delete_cache(user_id: str) -> None:
-    """Delete business understanding from Redis cache."""
+async def _fill_cache(user_id: str, understanding: BusinessUnderstanding) -> None:
+    """Cache a database read unless the key holds a newer write or a forget's marker."""
     try:
         redis = await get_redis_async()
-        await redis.delete(_cache_key(user_id))
+        await redis.set(
+            _cache_key(user_id),
+            understanding.model_dump_json(),
+            ex=CACHE_TTL_SECONDS,
+            nx=True,
+        )
     except Exception as e:
-        logger.warning(f"Failed to delete understanding from cache: {e}")
+        logger.warning(f"Failed to set understanding in cache: {e}")
 
 
 async def get_business_understanding(
@@ -222,39 +275,27 @@ async def get_business_understanding(
 
     understanding = BusinessUnderstanding.from_db(record)
 
-    # Store in cache for next time
-    await _set_cache(user_id, understanding)
+    await _fill_cache(user_id, understanding)
 
     return understanding
 
 
-async def upsert_business_understanding(
-    user_id: str,
+def merge_business_understanding_data(
+    existing_data: dict[str, Any],
     input_data: BusinessUnderstandingInput,
-) -> BusinessUnderstanding:
-    """
-    Create or update business understanding with incremental merge strategy.
+) -> dict[str, Any]:
+    """Merge new input into existing data dict using incremental strategy.
 
     - String fields: new value overwrites if provided (not None)
     - List fields: new items are appended to existing (deduplicated)
+    - suggested_prompts: fully replaced if provided (not None)
 
-    Data is stored as: {name: ..., business: {version: 1, ...}}
+    Returns the merged data dict (mutates and returns *existing_data*).
     """
-    # Get existing record for merge
-    existing = await CoPilotUnderstanding.prisma().find_unique(
-        where={"userId": user_id}
-    )
-
-    # Get existing data structure or start fresh
-    existing_data: dict[str, Any] = {}
-    if existing and isinstance(existing.data, dict):
-        existing_data = dict(existing.data)
-
     existing_business: dict[str, Any] = {}
     if isinstance(existing_data.get("business"), dict):
         existing_business = dict(existing_data["business"])
 
-    # Business fields (stored inside business object)
     business_string_fields = [
         "job_title",
         "business_name",
@@ -292,16 +333,48 @@ async def upsert_business_understanding(
             merged = _merge_lists(existing_list, value)
             existing_business[field] = merged
 
+    # Suggested prompts - fully replace if provided
+    if input_data.suggested_prompts is not None:
+        existing_data["suggested_prompts"] = input_data.suggested_prompts
+
     # Set version and nest business data
     existing_business["version"] = 1
     existing_data["business"] = existing_business
+
+    return existing_data
+
+
+async def upsert_business_understanding(
+    user_id: str,
+    input_data: BusinessUnderstandingInput,
+) -> BusinessUnderstanding:
+    """
+    Create or update business understanding with incremental merge strategy.
+
+    - String fields: new value overwrites if provided (not None)
+    - List fields: new items are appended to existing (deduplicated)
+    - suggested_prompts: fully replaced if provided (not None)
+
+    Data is stored as: {name: ..., business: {version: 1, ...}}
+    """
+    # Get existing record for merge
+    existing = await CoPilotUnderstanding.prisma().find_unique(
+        where={"userId": user_id}
+    )
+
+    # Get existing data structure or start fresh
+    existing_data: dict[str, Any] = {}
+    if existing and isinstance(existing.data, dict):
+        existing_data = dict(existing.data)
+
+    merged_data = merge_business_understanding_data(existing_data, input_data)
 
     # Upsert with the merged data
     record = await CoPilotUnderstanding.prisma().upsert(
         where={"userId": user_id},
         data={
-            "create": {"userId": user_id, "data": SafeJson(existing_data)},
-            "update": {"data": SafeJson(existing_data)},
+            "create": {"userId": user_id, "data": SafeJson(merged_data)},
+            "update": {"data": SafeJson(merged_data)},
         },
     )
 
@@ -314,16 +387,14 @@ async def upsert_business_understanding(
 
 
 async def clear_business_understanding(user_id: str) -> bool:
-    """Clear/delete business understanding for a user from both DB and cache."""
-    # Delete from cache first
-    await _delete_cache(user_id)
+    """Delete the user's business understanding; True when there was one.
 
-    try:
-        await CoPilotUnderstanding.prisma().delete(where={"userId": user_id})
-        return True
-    except Exception:
-        # Record might not exist
-        return False
+    Raises when the cached copy could not be replaced, since it would be served for the TTL.
+    """
+    deleted = await CoPilotUnderstanding.prisma().delete_many(where={"userId": user_id})
+    redis = await get_redis_async()
+    await redis.set(_cache_key(user_id), FORGOTTEN_MARKER, ex=CACHE_TTL_SECONDS)
+    return deleted > 0
 
 
 def format_understanding_for_prompt(understanding: BusinessUnderstanding) -> str:

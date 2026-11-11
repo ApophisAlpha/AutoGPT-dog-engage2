@@ -1,10 +1,11 @@
+import { cn } from "@/lib/utils";
 import { RJSFSchema } from "@rjsf/utils";
-import { preprocessInputSchema } from "./utils/input-schema-pre-processor";
-import { useMemo } from "react";
-import { customValidator } from "./utils/custom-validator";
+import { useId, useMemo } from "react";
 import Form from "./registry";
 import { ExtendedFormContextType } from "./types";
+import { customValidator } from "./utils/custom-validator";
 import { generateUiSchemaForCustomFields } from "./utils/generate-ui-schema";
+import { preprocessInputSchema } from "./utils/input-schema-pre-processor";
 
 type FormRendererProps = {
   jsonSchema: RJSFSchema;
@@ -12,15 +13,18 @@ type FormRendererProps = {
   uiSchema: any;
   initialValues: any;
   formContext: ExtendedFormContextType;
+  className?: string;
 };
 
-export const FormRenderer = ({
+export function FormRenderer({
   jsonSchema,
   handleChange,
   uiSchema,
   initialValues,
   formContext,
-}: FormRendererProps) => {
+  className,
+}: FormRendererProps) {
+  const domIdPrefix = `${useId()}-`;
   const preprocessedSchema = useMemo(() => {
     return preprocessInputSchema(jsonSchema);
   }, [jsonSchema]);
@@ -30,12 +34,10 @@ export const FormRenderer = ({
     return generateUiSchemaForCustomFields(preprocessedSchema, uiSchema);
   }, [preprocessedSchema, uiSchema]);
 
-  console.log("preprocessedSchema", preprocessedSchema);
-
   return (
-    <div className={"mb-6 mt-4"} data-tutorial-id="input-handles">
+    <div className={cn("mt-4", className)} data-tutorial-id="input-handles">
       <Form
-        formContext={formContext}
+        formContext={{ ...formContext, domIdPrefix }}
         idPrefix="agpt"
         idSeparator="_%_"
         schema={preprocessedSchema}
@@ -47,4 +49,4 @@ export const FormRenderer = ({
       />
     </div>
   );
-};
+}

@@ -8,29 +8,40 @@ import {
   TableHeader,
   TableHead,
   TableBody,
-} from "@/components/__legacy__/ui/table";
-import { Badge } from "@/components/__legacy__/ui/badge";
-import { ChevronDown, ChevronRight } from "lucide-react";
-import { formatDistanceToNow } from "date-fns";
+} from "@/components/molecules/Table/components/TablePrimitives";
 import {
-  type StoreListingWithVersions,
-  type StoreSubmission,
-  SubmissionStatus,
-} from "@/lib/autogpt-server-api/types";
+  ArrowDown01Icon,
+  ArrowRight01Icon,
+  EyeIcon,
+} from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import Link from "next/link";
+import { formatDistanceToNow } from "date-fns";
+import type { StoreListingWithVersionsAdminView } from "@/app/api/__generated__/models/storeListingWithVersionsAdminView";
+import type { StoreSubmissionAdminView } from "@/app/api/__generated__/models/storeSubmissionAdminView";
+import { SubmissionStatus } from "@/app/api/__generated__/models/submissionStatus";
+import { Button } from "@/components/atoms/Button/Button";
+import { Text } from "@/components/atoms/Text/Text";
+import { cn } from "@/lib/utils";
 import { ApproveRejectButtons } from "./ApproveRejectButton";
 import { DownloadAgentAdminButton } from "./DownloadAgentButton";
+
+const STATUS_CHIP =
+  "inline-flex cursor-default items-center rounded-md border border-transparent px-2.5 py-0.5 text-caption font-semibold leading-4 text-action-foreground shadow";
 
 // Moved the getStatusBadge function into the client component
 const getStatusBadge = (status: SubmissionStatus) => {
   switch (status) {
     case SubmissionStatus.PENDING:
-      return <Badge className="bg-amber-500">Pending</Badge>;
+      return <span className={cn(STATUS_CHIP, "bg-warning")}>Pending</span>;
     case SubmissionStatus.APPROVED:
-      return <Badge className="bg-green-500">Approved</Badge>;
+      return <span className={cn(STATUS_CHIP, "bg-success")}>Approved</span>;
     case SubmissionStatus.REJECTED:
-      return <Badge className="bg-red-500">Rejected</Badge>;
+      return <span className={cn(STATUS_CHIP, "bg-error")}>Rejected</span>;
     default:
-      return <Badge className="bg-gray-500">Draft</Badge>;
+      return (
+        <span className={cn(STATUS_CHIP, "bg-foreground-tertiary")}>Draft</span>
+      );
   }
 };
 
@@ -38,26 +49,25 @@ export function ExpandableRow({
   listing,
   latestVersion,
 }: {
-  listing: StoreListingWithVersions;
-  latestVersion: StoreSubmission | null;
+  listing: StoreListingWithVersionsAdminView;
+  latestVersion: StoreSubmissionAdminView | null;
 }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
     <>
-      <TableRow className="cursor-pointer hover:bg-muted/50">
+      <TableRow className="cursor-pointer">
         <TableCell onClick={() => setExpanded(!expanded)}>
           {expanded ? (
-            <ChevronDown className="h-4 w-4" />
+            <Icon aria-hidden icon={ArrowDown01Icon} className="h-4 w-4" />
           ) : (
-            <ChevronRight className="h-4 w-4" />
+            <Icon aria-hidden icon={ArrowRight01Icon} className="h-4 w-4" />
           )}
         </TableCell>
-        <TableCell
-          className="font-medium"
-          onClick={() => setExpanded(!expanded)}
-        >
-          {latestVersion?.name || "Unnamed Agent"}
+        <TableCell onClick={() => setExpanded(!expanded)}>
+          <span className="font-medium">
+            {latestVersion?.name || "Unnamed Agent"}
+          </span>
         </TableCell>
         <TableCell onClick={() => setExpanded(!expanded)}>
           {listing.creator_email || "Unknown"}
@@ -69,18 +79,28 @@ export function ExpandableRow({
           {latestVersion?.status && getStatusBadge(latestVersion.status)}
         </TableCell>
         <TableCell onClick={() => setExpanded(!expanded)}>
-          {latestVersion?.date_submitted
-            ? formatDistanceToNow(new Date(latestVersion.date_submitted), {
+          {latestVersion?.submitted_at
+            ? formatDistanceToNow(new Date(latestVersion.submitted_at), {
                 addSuffix: true,
               })
             : "Unknown"}
         </TableCell>
         <TableCell className="text-right">
           <div className="flex justify-end gap-2">
-            {latestVersion?.store_listing_version_id && (
-              <DownloadAgentAdminButton
-                storeListingVersionId={latestVersion.store_listing_version_id}
-              />
+            {latestVersion?.listing_version_id && (
+              <>
+                <Link
+                  href={`/admin/marketplace/preview/${latestVersion.listing_version_id}`}
+                >
+                  <Button size="xs" variant="secondary">
+                    <Icon aria-hidden icon={EyeIcon} className="h-4 w-4" />
+                    Preview
+                  </Button>
+                </Link>
+                <DownloadAgentAdminButton
+                  storeListingVersionId={latestVersion.listing_version_id}
+                />
+              </>
             )}
 
             {(latestVersion?.status === SubmissionStatus.PENDING ||
@@ -94,9 +114,16 @@ export function ExpandableRow({
       {/* Expanded version history */}
       {expanded && (
         <TableRow>
-          <TableCell colSpan={7} className="border-t-0 p-0">
-            <div className="bg-muted/30 px-4 py-3">
-              <h4 className="mb-2 text-sm font-semibold">Version History</h4>
+          <td colSpan={7} className="p-0">
+            <div className="bg-surface-hover/30 px-4 py-3">
+              <Text
+                variant="body-semibold-tight"
+                as="h4"
+                tone="inherit"
+                className="mb-2"
+              >
+                Version History
+              </Text>
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -110,20 +137,25 @@ export function ExpandableRow({
                     <TableHead>Name</TableHead>
                     <TableHead>Sub Heading</TableHead>
                     <TableHead>Description</TableHead>
-                    {/* <TableHead>Categories</TableHead> */}
+                    <TableHead>Categories</TableHead>
                     <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {listing.versions
-                    .sort((a, b) => (b.version ?? 1) - (a.version ?? 0))
+                  {(listing.versions ?? [])
+                    .sort(
+                      (a, b) =>
+                        (b.listing_version ?? 1) - (a.listing_version ?? 0),
+                    )
                     .map((version) => (
-                      <TableRow key={version.store_listing_version_id}>
+                      <TableRow key={version.listing_version_id}>
                         <TableCell>
-                          v{version.version || "?"}
-                          {version.store_listing_version_id ===
-                            listing.active_version_id && (
-                            <Badge className="ml-2 bg-blue-500">Active</Badge>
+                          v{version.listing_version || "?"}
+                          {version.listing_version_id ===
+                            listing.active_listing_version_id && (
+                            <span className={cn(STATUS_CHIP, "ml-2 bg-info")}>
+                              Active
+                            </span>
                           )}
                         </TableCell>
                         <TableCell>{getStatusBadge(version.status)}</TableCell>
@@ -131,9 +163,9 @@ export function ExpandableRow({
                           {version.changes_summary || "No summary"}
                         </TableCell>
                         <TableCell>
-                          {version.date_submitted
+                          {version.submitted_at
                             ? formatDistanceToNow(
-                                new Date(version.date_submitted),
+                                new Date(version.submitted_at),
                                 { addSuffix: true },
                               )
                             : "Unknown"}
@@ -148,7 +180,7 @@ export function ExpandableRow({
                               )
                             : "Not reviewed"}
                         </TableCell>
-                        <TableCell className="max-w-xs truncate">
+                        <TableCell className="max-w-xs overflow-hidden">
                           {version.review_comments ? (
                             <div
                               className="truncate"
@@ -157,21 +189,21 @@ export function ExpandableRow({
                               {version.review_comments}
                             </div>
                           ) : (
-                            <span className="text-gray-400">
+                            <span className="block truncate text-foreground-subtle">
                               No external comments
                             </span>
                           )}
                         </TableCell>
-                        <TableCell className="max-w-xs truncate">
+                        <TableCell className="max-w-xs overflow-hidden">
                           {version.internal_comments ? (
                             <div
-                              className="truncate text-pink-600"
+                              className="truncate text-pink-foreground"
                               title={version.internal_comments}
                             >
                               {version.internal_comments}
                             </div>
                           ) : (
-                            <span className="text-gray-400">
+                            <span className="block truncate text-foreground-subtle">
                               No internal comments
                             </span>
                           )}
@@ -179,15 +211,33 @@ export function ExpandableRow({
                         <TableCell>{version.name}</TableCell>
                         <TableCell>{version.sub_heading}</TableCell>
                         <TableCell>{version.description}</TableCell>
-                        {/* <TableCell>{version.categories.join(", ")}</TableCell> */}
+                        <TableCell>
+                          {version.categories.length > 0
+                            ? version.categories.join(", ")
+                            : "None"}
+                        </TableCell>
                         <TableCell className="text-right">
                           <div className="flex justify-end gap-2">
-                            {version.store_listing_version_id && (
-                              <DownloadAgentAdminButton
-                                storeListingVersionId={
-                                  version.store_listing_version_id
-                                }
-                              />
+                            {version.listing_version_id && (
+                              <>
+                                <Link
+                                  href={`/admin/marketplace/preview/${version.listing_version_id}`}
+                                >
+                                  <Button size="xs" variant="secondary">
+                                    <Icon
+                                      aria-hidden
+                                      icon={EyeIcon}
+                                      className="h-4 w-4"
+                                    />
+                                    Preview
+                                  </Button>
+                                </Link>
+                                <DownloadAgentAdminButton
+                                  storeListingVersionId={
+                                    version.listing_version_id
+                                  }
+                                />
+                              </>
                             )}
                             {(version.status === SubmissionStatus.PENDING ||
                               version.status === SubmissionStatus.APPROVED) && (
@@ -200,7 +250,7 @@ export function ExpandableRow({
                 </TableBody>
               </Table>
             </div>
-          </TableCell>
+          </td>
         </TableRow>
       )}
     </>

@@ -9,7 +9,9 @@ import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { uploadAgentFormSchema } from "./LibraryUploadAgentDialog";
 
-export function useLibraryUploadAgentDialog() {
+export function useLibraryUploadAgentDialog(options?: {
+  onSuccess?: () => void;
+}) {
   const [isOpen, setIsOpen] = useState(false);
   const { toast } = useToast();
   const [agentObject, setAgentObject] = useState<Graph | null>(null);
@@ -19,9 +21,10 @@ export function useLibraryUploadAgentDialog() {
       mutation: {
         onSuccess: ({ data }) => {
           setIsOpen(false);
+          options?.onSuccess?.();
           toast({
             title: "Success",
-            description: "Agent uploaded successfully",
+            description: "Workflow uploaded successfully",
             variant: "default",
           });
           const qID = "flowID";
@@ -30,7 +33,7 @@ export function useLibraryUploadAgentDialog() {
         onError: () => {
           toast({
             title: "Error",
-            description: "Error Uploading agent",
+            description: "Error Uploading workflow",
             variant: "destructive",
           });
         },
@@ -83,7 +86,7 @@ export function useLibraryUploadAgentDialog() {
         )
       ) {
         throw new Error(
-          "Invalid agent file. Please upload a valid agent.json file that has been previously exported from the AutoGPT platform. The file must contain the required fields: name, description, nodes, and links.",
+          "Invalid workflow file. Please upload a valid agent.json file that has been previously exported from the AutoGPT platform. The file must contain the required fields: name, description, nodes, and links.",
         );
       }
 
@@ -102,7 +105,7 @@ export function useLibraryUploadAgentDialog() {
       console.error("Error loading agent file:", error);
 
       toast({
-        title: "Invalid Agent File",
+        title: "Invalid Workflow File",
         description:
           "Please upload a valid agent.json file that has been previously exported from the AutoGPT platform. The file must contain the required fields: name, description, nodes, and links.",
         duration: 5000,
@@ -114,9 +117,9 @@ export function useLibraryUploadAgentDialog() {
     }
   }, [agentFileValue, form, toast]);
 
-  const onSubmit = async (values: z.infer<typeof uploadAgentFormSchema>) => {
+  async function onSubmit(values: z.infer<typeof uploadAgentFormSchema>) {
     if (!agentObject) {
-      form.setError("root", { message: "No Agent object to save" });
+      form.setError("root", { message: "No workflow object to save" });
       return;
     }
 
@@ -133,7 +136,7 @@ export function useLibraryUploadAgentDialog() {
         source: "upload",
       },
     });
-  };
+  }
 
   return {
     onSubmit,

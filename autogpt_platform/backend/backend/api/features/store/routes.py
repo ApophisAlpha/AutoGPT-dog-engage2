@@ -1,28 +1,44 @@
 import logging
-import tempfile
-import typing
 import urllib.parse
+from collections.abc import Mapping
 from typing import Literal
 
 import autogpt_libs.auth
 import fastapi
 import fastapi.responses
 import prisma.enums
+from fastapi import Depends, Query, Security
+from pydantic import BaseModel
+from starlette.datastructures import Headers
 
 import backend.data.graph
 import backend.util.json
-from backend.util.models import Pagination
+from backend.api.features.search import hybrid_search as search_engine
+from backend.api.features.search.rate_limit import enforce_public_search_rate_limit
+from backend.api.utils.client_ip import ClientIP
+from backend.copilot.rate_limit import enforce_payment_paywall
+from backend.util.exceptions import NotFoundError
+from backend.util.models import MAX_PAGE, MAX_PAGE_SIZE, Pagination
+from backend.util.product_analytics import track_listing_downloaded
 
 from . import cache as store_cache
+from . import categories as store_categories
 from . import db as store_db
-from . import hybrid_search as store_hybrid_search
 from . import image_gen as store_image_gen
+from . import local_media
 from . import media as store_media
 from . import model as store_model
+from . import submission_media
 
 logger = logging.getLogger(__name__)
 
 router = fastapi.APIRouter()
+
+SubmissionSortKey = Literal["submitted", "runs"]
+SubmissionSortDir = Literal["asc", "desc"]
+
+# Same bound as global search: caps what one query can cost to embed.
+MAX_SEARCH_QUERY_LENGTH = 512
 
 
 ##############################################
@@ -34,22 +50,16 @@ router = fastapi.APIRouter()
     "/profile",
     summary="Get user profile",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.ProfileDetails,
+    dependencies=[Security(autogpt_libs.auth.requires_user)],
 )
 async def get_profile(
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-):
-    """
-    Get the profile details for the authenticated user.
-    Cached for 1 hour per user.
-    """
-    profile = await store_db.get_user_profile(user_id)
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+) -> store_model.ProfileDetails:
+    """Get the profile details for the authenticated user, creating their
+    default profile if account setup hasn't yet."""
+    profile = await store_db.get_or_create_user_profile(user_id)
     if profile is None:
-        return fastapi.responses.JSONResponse(
-            status_code=404,
-            content={"detail": "Profile not found"},
-        )
+        raise NotFoundError("User does not have a profile yet")
     return profile
 
 
@@ -57,96 +67,15 @@ async def get_profile(
     "/profile",
     summary="Update user profile",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.CreatorDetails,
+    dependencies=[Security(autogpt_libs.auth.requires_user)],
 )
 async def update_or_create_profile(
-    profile: store_model.Profile,
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-):
-    """
-    Update the store profile for the authenticated user.
-
-    Args:
-        profile (Profile): The updated profile details
-        user_id (str): ID of the authenticated user
-
-    Returns:
-        CreatorDetails: The updated profile
-
-    Raises:
-        HTTPException: If there is an error updating the profile
-    """
+    profile: store_model.ProfileUpdateRequest,
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+) -> store_model.ProfileDetails:
+    """Update the store profile for the authenticated user."""
     updated_profile = await store_db.update_profile(user_id=user_id, profile=profile)
     return updated_profile
-
-
-##############################################
-############### Agent Endpoints ##############
-##############################################
-
-
-@router.get(
-    "/agents",
-    summary="List store agents",
-    tags=["store", "public"],
-    response_model=store_model.StoreAgentsResponse,
-)
-async def get_agents(
-    featured: bool = False,
-    creator: str | None = None,
-    sorted_by: Literal["rating", "runs", "name", "updated_at"] | None = None,
-    search_query: str | None = None,
-    category: str | None = None,
-    page: int = 1,
-    page_size: int = 20,
-):
-    """
-    Get a paginated list of agents from the store with optional filtering and sorting.
-
-    Args:
-        featured (bool, optional): Filter to only show featured agents. Defaults to False.
-        creator (str | None, optional): Filter agents by creator username. Defaults to None.
-        sorted_by (str | None, optional): Sort agents by "runs" or "rating". Defaults to None.
-        search_query (str | None, optional): Search agents by name, subheading and description. Defaults to None.
-        category (str | None, optional): Filter agents by category. Defaults to None.
-        page (int, optional): Page number for pagination. Defaults to 1.
-        page_size (int, optional): Number of agents per page. Defaults to 20.
-
-    Returns:
-        StoreAgentsResponse: Paginated list of agents matching the filters
-
-    Raises:
-        HTTPException: If page or page_size are less than 1
-
-    Used for:
-    - Home Page Featured Agents
-    - Home Page Top Agents
-    - Search Results
-    - Agent Details - Other Agents By Creator
-    - Agent Details - Similar Agents
-    - Creator Details - Agents By Creator
-    """
-    if page < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page must be greater than 0"
-        )
-
-    if page_size < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page size must be greater than 0"
-        )
-
-    agents = await store_cache._get_cached_store_agents(
-        featured=featured,
-        creator=creator,
-        sorted_by=sorted_by,
-        search_query=search_query,
-        category=category,
-        page=page,
-        page_size=page_size,
-    )
-    return agents
 
 
 ##############################################
@@ -158,63 +87,36 @@ async def get_agents(
     "/search",
     summary="Unified search across all content types",
     tags=["store", "public"],
-    response_model=store_model.UnifiedSearchResponse,
 )
 async def unified_search(
-    query: str,
-    content_types: list[str] | None = fastapi.Query(
+    client: ClientIP,
+    query: str = Query(max_length=MAX_SEARCH_QUERY_LENGTH),
+    content_types: list[prisma.enums.ContentType] | None = Query(
         default=None,
-        description="Content types to search: STORE_AGENT, BLOCK, DOCUMENTATION. If not specified, searches all.",
+        description="Content types to search. If not specified, searches all.",
     ),
-    page: int = 1,
-    page_size: int = 20,
-    user_id: str | None = fastapi.Security(
+    page: int = Query(ge=1, le=MAX_PAGE, default=1),
+    page_size: int = Query(ge=1, le=MAX_PAGE_SIZE, default=20),
+    user_id: str | None = Security(
         autogpt_libs.auth.get_optional_user_id, use_cache=False
     ),
-):
+) -> store_model.UnifiedSearchResponse:
     """
-    Search across all content types (store agents, blocks, documentation) using hybrid search.
+    Search across all content types (marketplace agents, blocks, documentation)
+    using hybrid search.
 
     Combines semantic (embedding-based) and lexical (text-based) search for best results.
-
-    Args:
-        query: The search query string
-        content_types: Optional list of content types to filter by (STORE_AGENT, BLOCK, DOCUMENTATION)
-        page: Page number for pagination (default 1)
-        page_size: Number of results per page (default 20)
-        user_id: Optional authenticated user ID (for user-scoped content in future)
-
-    Returns:
-        UnifiedSearchResponse: Paginated list of search results with relevance scores
     """
-    if page < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page must be greater than 0"
-        )
-
-    if page_size < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page size must be greater than 0"
-        )
-
-    # Convert string content types to enum
-    content_type_enums: list[prisma.enums.ContentType] | None = None
-    if content_types:
-        try:
-            content_type_enums = [prisma.enums.ContentType(ct) for ct in content_types]
-        except ValueError as e:
-            raise fastapi.HTTPException(
-                status_code=422,
-                detail=f"Invalid content type. Valid values: STORE_AGENT, BLOCK, DOCUMENTATION. Error: {e}",
-            )
+    await enforce_public_search_rate_limit(client, user_id=user_id)
 
     # Perform unified hybrid search
-    results, total = await store_hybrid_search.unified_hybrid_search(
+    results, total = await search_engine.unified_hybrid_search(
         query=query,
-        content_types=content_type_enums,
+        content_types=content_types,
         user_id=user_id,
         page=page,
         page_size=page_size,
+        public_search=True,
     )
 
     # Convert results to response model
@@ -245,60 +147,100 @@ async def unified_search(
     )
 
 
+##############################################
+############### Agent Endpoints ##############
+##############################################
+
+
+@router.get(
+    "/agents",
+    summary="List store agents",
+    tags=["store", "public"],
+)
+async def get_agents(
+    client: ClientIP,
+    featured: bool = Query(
+        default=False, description="Filter to only show featured agents"
+    ),
+    creator: str | None = Query(
+        default=None, description="Filter agents by creator username"
+    ),
+    category: str | None = Query(default=None, description="Filter agents by category"),
+    search_query: str | None = Query(
+        default=None,
+        max_length=MAX_SEARCH_QUERY_LENGTH,
+        description="Literal + semantic search on names and descriptions",
+    ),
+    sorted_by: store_db.StoreAgentsSortOptions | None = Query(
+        default=None,
+        description="Property to sort results by. Ignored if search_query is provided.",
+    ),
+    page: int = Query(ge=1, le=MAX_PAGE, default=1),
+    page_size: int = Query(ge=1, le=MAX_PAGE_SIZE, default=20),
+    user_id: str | None = Security(
+        autogpt_libs.auth.get_optional_user_id, use_cache=False
+    ),
+) -> store_model.StoreAgentsResponse:
+    """
+    Get a paginated list of agents from the marketplace,
+    with optional filtering and sorting.
+
+    Used for:
+    - Home Page Featured Agents
+    - Home Page Top Agents
+    - Search Results
+    - Agent Details - Other Agents By Creator
+    - Agent Details - Similar Agents
+    - Creator Details - Agents By Creator
+    """
+    if search_query and search_query.strip():
+        await enforce_public_search_rate_limit(client, user_id=user_id)
+    agents = await store_cache.get_public_store_agents(
+        featured=featured,
+        creator=creator,
+        sorted_by=sorted_by,
+        search_query=search_query,
+        category=category,
+        page=page,
+        page_size=page_size,
+    )
+    return agents
+
+
+@router.get(
+    "/categories",
+    summary="List store categories",
+    tags=["store", "public"],
+)
+async def get_categories() -> list[store_model.StoreCategoryInfo]:
+    """The canonical categories a listing can be filed under."""
+    return [
+        store_model.StoreCategoryInfo(
+            value=category.value,
+            label=store_categories.CATEGORY_LABELS[category],
+            description=store_categories.CATEGORY_DESCRIPTIONS[category],
+        )
+        for category in store_categories.StoreCategory
+    ]
+
+
 @router.get(
     "/agents/{username}/{agent_name}",
     summary="Get specific agent",
     tags=["store", "public"],
-    response_model=store_model.StoreAgentDetails,
 )
-async def get_agent(
+async def get_agent_by_name(
     username: str,
     agent_name: str,
-    include_changelog: bool = fastapi.Query(default=False),
-):
-    """
-    This is only used on the AgentDetails Page.
-
-    It returns the store listing agents details.
-    """
+    include_changelog: bool = Query(default=False),
+) -> store_model.StoreAgentDetails:
+    """Get details of a marketplace agent"""
     username = urllib.parse.unquote(username).lower()
     # URL decode the agent name since it comes from the URL path
     agent_name = urllib.parse.unquote(agent_name).lower()
-    agent = await store_cache._get_cached_agent_details(
+    agent = await store_cache.get_cached_agent_details(
         username=username, agent_name=agent_name, include_changelog=include_changelog
     )
-    return agent
-
-
-@router.get(
-    "/graph/{store_listing_version_id}",
-    summary="Get agent graph",
-    tags=["store"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-)
-async def get_graph_meta_by_store_listing_version_id(
-    store_listing_version_id: str,
-) -> backend.data.graph.GraphMeta:
-    """
-    Get Agent Graph from Store Listing Version ID.
-    """
-    graph = await store_db.get_available_graph(store_listing_version_id)
-    return graph
-
-
-@router.get(
-    "/agents/{store_listing_version_id}",
-    summary="Get agent by version",
-    tags=["store"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.StoreAgentDetails,
-)
-async def get_store_agent(store_listing_version_id: str):
-    """
-    Get Store Agent Details from Store Listing Version ID.
-    """
-    agent = await store_db.get_store_agent_by_version_id(store_listing_version_id)
-
     return agent
 
 
@@ -306,38 +248,84 @@ async def get_store_agent(store_listing_version_id: str):
     "/agents/{username}/{agent_name}/review",
     summary="Create agent review",
     tags=["store"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.StoreReview,
+    dependencies=[
+        Security(autogpt_libs.auth.requires_user),
+        Depends(enforce_payment_paywall),
+    ],
 )
-async def create_review(
+async def post_user_review_for_agent(
     username: str,
     agent_name: str,
     review: store_model.StoreReviewCreate,
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-):
-    """
-    Create a review for a store agent.
-
-    Args:
-        username: Creator's username
-        agent_name: Name/slug of the agent
-        review: Review details including score and optional comments
-        user_id: ID of authenticated user creating the review
-
-    Returns:
-        The created review
-    """
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+) -> store_model.StoreReview:
+    """Post a user review on a marketplace agent listing"""
     username = urllib.parse.unquote(username).lower()
     agent_name = urllib.parse.unquote(agent_name).lower()
-    # Create the review
+
     created_review = await store_db.create_store_review(
         user_id=user_id,
         store_listing_version_id=review.store_listing_version_id,
         score=review.score,
         comments=review.comments,
     )
-
     return created_review
+
+
+@router.get(
+    "/listings/versions/{store_listing_version_id}",
+    summary="Get agent by version",
+    tags=["store"],
+)
+async def get_agent_by_listing_version(
+    store_listing_version_id: str,
+) -> store_model.StoreAgentDetails:
+    # Public on purpose: the query only reads the APPROVED-only StoreAgent
+    # view, so a signed-out expert page can show its workflows' preview images.
+    agent = await store_db.get_store_agent_by_version_id(store_listing_version_id)
+    return agent
+
+
+@router.get(
+    "/listings/versions/{store_listing_version_id}/graph",
+    summary="Get agent graph",
+    tags=["store"],
+    dependencies=[Security(autogpt_libs.auth.requires_user)],
+)
+async def get_graph_meta_by_store_listing_version_id(
+    store_listing_version_id: str,
+) -> backend.data.graph.GraphModelWithoutNodes:
+    """Get outline of graph belonging to a specific marketplace listing version"""
+    graph = await store_db.get_available_graph(store_listing_version_id)
+    # Public outline: it names the workflow, not the account that published it.
+    return graph.shared_copy()
+
+
+@router.get(
+    "/listings/versions/{store_listing_version_id}/graph/download",
+    summary="Download agent file",
+    tags=["store", "public"],
+)
+async def download_agent_file(
+    store_listing_version_id: str,
+    user_id: str | None = Security(autogpt_libs.auth.get_optional_user_id),
+) -> fastapi.responses.Response:
+    """Download agent graph file for a specific marketplace listing version"""
+    graph_data = await store_db.get_agent(store_listing_version_id)
+    track_listing_downloaded(
+        user_id=user_id,
+        store_listing_version_id=store_listing_version_id,
+        graph_id=graph_data.id,
+    )
+    file_name = f"agent_{graph_data.id}_v{graph_data.version or 'latest'}.json"
+
+    return fastapi.responses.Response(
+        content=backend.util.json.dumps(graph_data),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+        },
+    )
 
 
 ##############################################
@@ -349,38 +337,20 @@ async def create_review(
     "/creators",
     summary="List store creators",
     tags=["store", "public"],
-    response_model=store_model.CreatorsResponse,
 )
 async def get_creators(
-    featured: bool = False,
-    search_query: str | None = None,
-    sorted_by: Literal["agent_rating", "agent_runs", "num_agents"] | None = None,
-    page: int = 1,
-    page_size: int = 20,
-):
-    """
-    This is needed for:
-    - Home Page Featured Creators
-    - Search Results Page
-
-    ---
-
-    To support this functionality we need:
-    - featured: bool - to limit the list to just featured agents
-    - search_query: str - vector search based on the creators profile description.
-    - sorted_by: [agent_rating, agent_runs] -
-    """
-    if page < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page must be greater than 0"
-        )
-
-    if page_size < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page size must be greater than 0"
-        )
-
-    creators = await store_cache._get_cached_store_creators(
+    featured: bool = Query(
+        default=False, description="Filter to only show featured creators"
+    ),
+    search_query: str | None = Query(
+        default=None, description="Literal + semantic search on names and descriptions"
+    ),
+    sorted_by: store_db.StoreCreatorsSortOptions | None = None,
+    page: int = Query(ge=1, le=MAX_PAGE, default=1),
+    page_size: int = Query(ge=1, le=100, default=20),
+) -> store_model.CreatorsResponse:
+    """List or search marketplace creators"""
+    creators = await store_cache.get_cached_store_creators(
         featured=featured,
         search_query=search_query,
         sorted_by=sorted_by,
@@ -391,20 +361,14 @@ async def get_creators(
 
 
 @router.get(
-    "/creator/{username}",
+    "/creators/{username}",
     summary="Get creator details",
     tags=["store", "public"],
-    response_model=store_model.CreatorDetails,
 )
-async def get_creator(
-    username: str,
-):
-    """
-    Get the details of a creator.
-    - Creator Details Page
-    """
+async def get_creator(username: str) -> store_model.CreatorDetails:
+    """Get details on a marketplace creator"""
     username = urllib.parse.unquote(username).lower()
-    creator = await store_cache._get_cached_creator_details(username=username)
+    creator = await store_cache.get_cached_creator_details(username=username)
     return creator
 
 
@@ -414,21 +378,28 @@ async def get_creator(
 
 
 @router.get(
-    "/myagents",
+    "/my-unpublished-agents",
     summary="Get my agents",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.MyAgentsResponse,
+    dependencies=[Security(autogpt_libs.auth.requires_user)],
 )
-async def get_my_agents(
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-    page: typing.Annotated[int, fastapi.Query(ge=1)] = 1,
-    page_size: typing.Annotated[int, fastapi.Query(ge=1)] = 20,
-):
-    """
-    Get user's own agents.
-    """
-    agents = await store_db.get_my_agents(user_id, page=page, page_size=page_size)
+async def get_my_unpublished_agents(
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+    page: int = Query(ge=1, le=MAX_PAGE, default=1),
+    page_size: int = Query(ge=1, le=MAX_PAGE_SIZE, default=20),
+    sort_by: store_model.MyAgentsSortBy = Query(
+        default=store_model.MyAgentsSortBy.MOST_RECENT
+    ),
+    search_query: str | None = Query(default=None, max_length=100),
+) -> store_model.MyUnpublishedAgentsResponse:
+    """List the authenticated user's unpublished agents"""
+    agents = await store_db.get_my_agents(
+        user_id,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        search_query=search_query,
+    )
     return agents
 
 
@@ -436,28 +407,21 @@ async def get_my_agents(
     "/submissions/{submission_id}",
     summary="Delete store submission",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=bool,
+    dependencies=[Security(autogpt_libs.auth.requires_user)],
 )
 async def delete_submission(
     submission_id: str,
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-):
-    """
-    Delete a store listing submission.
-
-    Args:
-        user_id (str): ID of the authenticated user
-        submission_id (str): ID of the submission to be deleted
-
-    Returns:
-        bool: True if the submission was successfully deleted, False otherwise
-    """
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+    ctx: autogpt_libs.auth.RequestContext = Security(
+        autogpt_libs.auth.get_request_context
+    ),
+) -> bool:
+    """Delete a marketplace listing submission"""
     result = await store_db.delete_store_submission(
         user_id=user_id,
-        submission_id=submission_id,
+        store_listing_version_id=submission_id,
+        organization_id=getattr(ctx, "org_id", None),
     )
-
     return result
 
 
@@ -465,73 +429,82 @@ async def delete_submission(
     "/submissions",
     summary="List my submissions",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.StoreSubmissionsResponse,
+    dependencies=[Security(autogpt_libs.auth.requires_user)],
 )
 async def get_submissions(
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-    page: int = 1,
-    page_size: int = 20,
-):
-    """
-    Get a paginated list of store submissions for the authenticated user.
-
-    Args:
-        user_id (str): ID of the authenticated user
-        page (int, optional): Page number for pagination. Defaults to 1.
-        page_size (int, optional): Number of submissions per page. Defaults to 20.
-
-    Returns:
-        StoreListingsResponse: Paginated list of store submissions
-
-    Raises:
-        HTTPException: If page or page_size are less than 1
-    """
-    if page < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page must be greater than 0"
-        )
-
-    if page_size < 1:
-        raise fastapi.HTTPException(
-            status_code=422, detail="Page size must be greater than 0"
-        )
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+    ctx: autogpt_libs.auth.RequestContext = Security(
+        autogpt_libs.auth.get_request_context
+    ),
+    page: int = Query(ge=1, le=MAX_PAGE, default=1),
+    page_size: int = Query(ge=1, le=MAX_PAGE_SIZE, default=20),
+    search_query: str | None = Query(default=None, max_length=100),
+    statuses: str | None = Query(default=None),
+    sort_key: SubmissionSortKey | None = Query(default=None),
+    sort_dir: SubmissionSortDir = Query(default="desc"),
+) -> store_model.StoreSubmissionsResponse:
+    """List the authenticated user's marketplace listing submissions"""
+    parsed_statuses = _parse_status_filter(statuses)
     listings = await store_db.get_store_submissions(
         user_id=user_id,
+        organization_id=getattr(ctx, "org_id", None),
         page=page,
         page_size=page_size,
+        search_query=search_query,
+        statuses=parsed_statuses,
+        sort_key=sort_key,
+        sort_dir=sort_dir,
     )
     return listings
+
+
+def _parse_status_filter(
+    raw: str | None,
+) -> list[prisma.enums.SubmissionStatus] | None:
+    """Parse a comma-separated `statuses` query value into a typed list.
+
+    Orval's fetch client serializes array query params with `value.toString()`,
+    which produces a single comma-joined string (`?statuses=PENDING,APPROVED`)
+    instead of the FastAPI-default repeated form. Accept that shape here and
+    surface invalid enum members as a 422.
+    """
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return None
+    try:
+        return [prisma.enums.SubmissionStatus(p) for p in parts]
+    except ValueError as exc:
+        raise fastapi.HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post(
     "/submissions",
     summary="Create store submission",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.StoreSubmission,
+    dependencies=[
+        Security(autogpt_libs.auth.requires_user),
+        Depends(enforce_payment_paywall),
+    ],
 )
 async def create_submission(
     submission_request: store_model.StoreSubmissionRequest,
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-):
-    """
-    Create a new store listing submission.
-
-    Args:
-        submission_request (StoreSubmissionRequest): The submission details
-        user_id (str): ID of the authenticated user submitting the listing
-
-    Returns:
-        StoreSubmission: The created store submission
-
-    Raises:
-        HTTPException: If there is an error creating the submission
-    """
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+    ctx: autogpt_libs.auth.RequestContext = Security(
+        autogpt_libs.auth.get_request_context
+    ),
+) -> store_model.StoreSubmission:
+    """Submit a new marketplace listing for review"""
+    # Defensive: ``ctx`` may be the unresolved ``Security()`` sentinel when
+    # this function is invoked outside FastAPI's dependency-injection path
+    # (e.g. some integration tests). ``getattr`` with a default returns
+    # None instead of raising AttributeError on the sentinel.
+    org_id = getattr(ctx, "org_id", None)
     result = await store_db.create_store_submission(
         user_id=user_id,
-        agent_id=submission_request.agent_id,
-        agent_version=submission_request.agent_version,
+        graph_id=submission_request.graph_id,
+        graph_version=submission_request.graph_version,
         slug=submission_request.slug,
         name=submission_request.name,
         video_url=submission_request.video_url,
@@ -543,8 +516,8 @@ async def create_submission(
         categories=submission_request.categories,
         changes_summary=submission_request.changes_summary or "Initial Submission",
         recommended_schedule_cron=submission_request.recommended_schedule_cron,
+        organization_id=org_id,
     )
-
     return result
 
 
@@ -552,31 +525,24 @@ async def create_submission(
     "/submissions/{store_listing_version_id}",
     summary="Edit store submission",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
-    response_model=store_model.StoreSubmission,
+    dependencies=[
+        Security(autogpt_libs.auth.requires_user),
+        Depends(enforce_payment_paywall),
+    ],
 )
 async def edit_submission(
     store_listing_version_id: str,
     submission_request: store_model.StoreSubmissionEditRequest,
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-):
-    """
-    Edit an existing store listing submission.
-
-    Args:
-        store_listing_version_id (str): ID of the store listing version to edit
-        submission_request (StoreSubmissionRequest): The updated submission details
-        user_id (str): ID of the authenticated user editing the listing
-
-    Returns:
-        StoreSubmission: The updated store submission
-
-    Raises:
-        HTTPException: If there is an error editing the submission
-    """
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+    ctx: autogpt_libs.auth.RequestContext = Security(
+        autogpt_libs.auth.get_request_context
+    ),
+) -> store_model.StoreSubmission:
+    """Update a pending marketplace listing submission"""
     result = await store_db.edit_store_submission(
         user_id=user_id,
         store_listing_version_id=store_listing_version_id,
+        organization_id=getattr(ctx, "org_id", None),
         name=submission_request.name,
         video_url=submission_request.video_url,
         agent_output_demo_url=submission_request.agent_output_demo_url,
@@ -588,123 +554,249 @@ async def edit_submission(
         changes_summary=submission_request.changes_summary,
         recommended_schedule_cron=submission_request.recommended_schedule_cron,
     )
-
     return result
+
+
+@router.get(
+    "/media/{user_id}/{media_type}/{filename}",
+    summary="Get stored marketplace media",
+    response_class=fastapi.responses.FileResponse,
+    responses={
+        200: {
+            "content": {
+                content_type: {"schema": {"type": "string", "format": "binary"}}
+                for content_type in local_media.CONTENT_TYPE_EXTENSIONS
+            }
+        }
+    },
+    tags=["store", "public"],
+)
+def get_store_media(
+    user_id: str,
+    media_type: str,
+    filename: str,
+) -> fastapi.responses.FileResponse:
+    content_type = local_media.content_type_for_filename(filename)
+    if content_type is None or media_type not in local_media.MEDIA_TYPES:
+        raise NotFoundError("Media not found")
+    try:
+        path = local_media.get_media_path(user_id, media_type, filename)
+    except ValueError:
+        raise NotFoundError("Media not found")
+    if not path.is_file():
+        raise NotFoundError("Media not found")
+    return fastapi.responses.FileResponse(
+        path, media_type=content_type, headers={"X-Content-Type-Options": "nosniff"}
+    )
 
 
 @router.post(
     "/submissions/media",
     summary="Upload submission media",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
+    dependencies=[
+        Security(autogpt_libs.auth.requires_user),
+        Depends(enforce_payment_paywall),
+    ],
 )
 async def upload_submission_media(
     file: fastapi.UploadFile,
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-):
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+    purpose: Literal["submission", "expert-avatar"] = "submission",
+) -> str:
+    """Upload media for a marketplace listing submission or Expert appearance."""
+
+    return await store_media.upload_media(
+        user_id=user_id, file=file, is_avatar=purpose == "expert-avatar"
+    )
+
+
+@router.get(
+    "/submissions/media/{owner_user_id}/{media_type}/{filename}",
+    summary="Read private submission media",
+    response_class=fastapi.responses.StreamingResponse,
+    responses={
+        200: {
+            "content": {
+                content_type: {"schema": {"type": "string", "format": "binary"}}
+                for content_type in local_media.CONTENT_TYPE_EXTENSIONS
+            }
+        },
+        206: {
+            "description": "Requested byte range",
+            "content": {
+                content_type: {"schema": {"type": "string", "format": "binary"}}
+                for content_type in local_media.CONTENT_TYPE_EXTENSIONS
+            },
+        },
+        307: {"description": "Short-lived signed download URL"},
+        404: {"description": "Media not found"},
+        416: {"description": "Requested range is not satisfiable"},
+        503: {"description": "Private media is temporarily unavailable"},
+    },
+    tags=["store", "private"],
+)
+async def get_private_submission_media(
+    owner_user_id: str,
+    media_type: str,
+    filename: str,
+    request: fastapi.Request,
+    user: autogpt_libs.auth.User = Security(autogpt_libs.auth.requires_user),
+) -> fastapi.Response:
     """
-    Upload media (images/videos) for a store listing submission.
-
-    Args:
-        file (UploadFile): The media file to upload
-        user_id (str): ID of the authenticated user uploading the media
-
-    Returns:
-        str: URL of the uploaded media file
-
-    Raises:
-        HTTPException: If there is an error uploading the media
+    Serve a user's private media to them, to members of an organization they
+    share, and to admins. Anyone else gets a 404, as if it did not exist.
     """
-    media_url = await store_media.upload_media(user_id=user_id, file=file)
-    return media_url
+    content_type = local_media.content_type_for_filename(filename)
+    if content_type is None:
+        raise NotFoundError("Media not found")
+    if not await submission_media.can_read(user, owner_user_id):
+        raise NotFoundError("Media not found")
+    try:
+        metadata = await submission_media.metadata(owner_user_id, media_type, filename)
+    except (FileNotFoundError, ValueError):
+        raise NotFoundError("Media not found")
+
+    headers = {
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Accept-Ranges": "bytes",
+    }
+    total_size = _private_media_size(metadata)
+    range_header = request.headers.get("range")
+    if (
+        range_header is None
+        and total_size > submission_media.PRIVATE_MEDIA_PROXY_BUFFER_BYTES
+    ):
+        try:
+            redirect_url = await submission_media.signed_url(
+                owner_user_id, media_type, filename
+            )
+        except Exception as error:
+            logger.error("Failed to sign oversized private media", exc_info=True)
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail="Private media is temporarily unavailable",
+                headers=headers,
+            ) from error
+        if redirect_url:
+            return fastapi.responses.RedirectResponse(
+                redirect_url,
+                status_code=307,
+                headers=headers,
+            )
+
+    byte_range: tuple[int, int] | None = None
+    status_code = 200
+    if range_header:
+        try:
+            byte_range = _parse_private_media_range(range_header, total_size)
+        except ValueError:
+            headers["Content-Range"] = f"bytes */{total_size}"
+            raise fastapi.HTTPException(
+                status_code=416,
+                detail="Requested range is not satisfiable",
+                headers=headers,
+            )
+        start, end = byte_range
+        headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+        headers["Content-Length"] = str(end - start + 1)
+        status_code = 206
+    else:
+        headers["Content-Length"] = str(total_size)
+    return fastapi.responses.StreamingResponse(
+        submission_media.stream(owner_user_id, media_type, filename, byte_range),
+        status_code=status_code,
+        media_type=content_type,
+        headers=headers,
+    )
+
+
+def _private_media_size(metadata: Mapping[str, object]) -> int:
+    try:
+        size = int(str(metadata["size"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise NotFoundError("Media not found") from error
+    if size < 0:
+        raise NotFoundError("Media not found")
+    return size
+
+
+def _parse_private_media_range(value: str, total_size: int) -> tuple[int, int]:
+    if total_size <= 0 or len(value) > 64 or not value.startswith("bytes="):
+        raise ValueError("Invalid range")
+    specification = value.removeprefix("bytes=").strip()
+    if "," in specification or specification.count("-") != 1:
+        raise ValueError("Invalid range")
+    start_text, end_text = specification.split("-", 1)
+    if start_text:
+        if not start_text.isdigit() or (end_text and not end_text.isdigit()):
+            raise ValueError("Invalid range")
+        start = int(start_text)
+        end = int(end_text) if end_text else total_size - 1
+        if start >= total_size or end < start:
+            raise ValueError("Invalid range")
+        return start, min(end, total_size - 1)
+    if not end_text.isdigit():
+        raise ValueError("Invalid range")
+    suffix_length = int(end_text)
+    if suffix_length <= 0:
+        raise ValueError("Invalid range")
+    return max(0, total_size - suffix_length), total_size - 1
+
+
+class ImageURLResponse(BaseModel):
+    image_url: str
 
 
 @router.post(
     "/submissions/generate_image",
     summary="Generate submission image",
     tags=["store", "private"],
-    dependencies=[fastapi.Security(autogpt_libs.auth.requires_user)],
+    dependencies=[
+        Security(autogpt_libs.auth.requires_user),
+        Depends(enforce_payment_paywall),
+    ],
 )
 async def generate_image(
-    agent_id: str,
-    user_id: str = fastapi.Security(autogpt_libs.auth.get_user_id),
-) -> fastapi.responses.Response:
+    graph_id: str,
+    user_id: str = Security(autogpt_libs.auth.get_user_id),
+) -> ImageURLResponse:
     """
-    Generate an image for a store listing submission.
-
-    Args:
-        agent_id (str): ID of the agent to generate an image for
-        user_id (str): ID of the authenticated user
-
-    Returns:
-        JSONResponse: JSON containing the URL of the generated image
+    Generate an image for a marketplace listing submission based on the properties
+    of a given graph.
     """
-    agent = await backend.data.graph.get_graph(
-        graph_id=agent_id, version=None, user_id=user_id
+    graph = await backend.data.graph.get_graph(
+        graph_id=graph_id, version=None, user_id=user_id
     )
 
-    if not agent:
-        raise fastapi.HTTPException(
-            status_code=404, detail=f"Agent with ID {agent_id} not found"
-        )
+    if not graph:
+        raise NotFoundError(f"Agent graph #{graph_id} not found")
     # Use .jpeg here since we are generating JPEG images
-    filename = f"agent_{agent_id}.jpeg"
+    filename = f"agent_{graph_id}.jpeg"
 
-    existing_url = await store_media.check_media_exists(user_id, filename)
+    try:
+        existing_url = await store_media.check_media_exists(user_id, filename)
+    except Exception:
+        logger.exception(f"Could not check for an existing image of graph {graph_id}")
+        existing_url = None
     if existing_url:
-        logger.info(f"Using existing image for agent {agent_id}")
-        return fastapi.responses.JSONResponse(content={"image_url": existing_url})
+        logger.info(f"Using existing image for agent graph {graph_id}")
+        return ImageURLResponse(image_url=existing_url)
     # Generate agent image as JPEG
-    image = await store_image_gen.generate_agent_image(agent=agent)
+    image = await store_image_gen.generate_agent_image(agent=graph, user_id=user_id)
 
     # Create UploadFile with the correct filename and content_type
     image_file = fastapi.UploadFile(
         file=image,
         filename=filename,
+        headers=Headers({"content-type": "image/jpeg"}),
     )
-
     image_url = await store_media.upload_media(
         user_id=user_id, file=image_file, use_file_name=True
     )
 
-    return fastapi.responses.JSONResponse(content={"image_url": image_url})
-
-
-@router.get(
-    "/download/agents/{store_listing_version_id}",
-    summary="Download agent file",
-    tags=["store", "public"],
-)
-async def download_agent_file(
-    store_listing_version_id: str = fastapi.Path(
-        ..., description="The ID of the agent to download"
-    ),
-) -> fastapi.responses.FileResponse:
-    """
-    Download the agent file by streaming its content.
-
-    Args:
-        store_listing_version_id (str): The ID of the agent to download
-
-    Returns:
-        StreamingResponse: A streaming response containing the agent's graph data.
-
-    Raises:
-        HTTPException: If the agent is not found or an unexpected error occurs.
-    """
-    graph_data = await store_db.get_agent(store_listing_version_id)
-    file_name = f"agent_{graph_data.id}_v{graph_data.version or 'latest'}.json"
-
-    # Sending graph as a stream (similar to marketplace v1)
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False
-    ) as tmp_file:
-        tmp_file.write(backend.util.json.dumps(graph_data))
-        tmp_file.flush()
-
-        return fastapi.responses.FileResponse(
-            tmp_file.name, filename=file_name, media_type="application/json"
-        )
+    return ImageURLResponse(image_url=image_url)
 
 
 ##############################################
@@ -735,19 +827,23 @@ async def get_cache_metrics():
         info = cache_func.cache_info()
         # Cache size metric (dynamic - changes as items are cached/expired)
         metrics.append(f'store_cache_entries{{cache="{cache_name}"}} {info["size"]}')
-        # Cache utilization percentage (dynamic - useful for monitoring)
+        # Cache utilization percentage (dynamic - useful for monitoring).
+        # An unbounded cache reports maxsize=None → utilization is undefined
+        # (0), and comparing None > 0 would raise, 500-ing the endpoint.
         utilization = (
-            (info["size"] / info["maxsize"] * 100) if info["maxsize"] > 0 else 0
+            (info["size"] / info["maxsize"] * 100)
+            if info["maxsize"] and info["maxsize"] > 0
+            else 0
         )
         metrics.append(
             f'store_cache_utilization_percent{{cache="{cache_name}"}} {utilization:.2f}'
         )
 
     # Add metrics for each cache
-    add_cache_metrics("store_agents", store_cache._get_cached_store_agents)
-    add_cache_metrics("agent_details", store_cache._get_cached_agent_details)
-    add_cache_metrics("store_creators", store_cache._get_cached_store_creators)
-    add_cache_metrics("creator_details", store_cache._get_cached_creator_details)
+    add_cache_metrics("store_agents", store_cache.get_cached_store_agents)
+    add_cache_metrics("agent_details", store_cache.get_cached_agent_details)
+    add_cache_metrics("store_creators", store_cache.get_cached_store_creators)
+    add_cache_metrics("creator_details", store_cache.get_cached_creator_details)
 
     # Add metadata/help text at the beginning
     prometheus_output = [

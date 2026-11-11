@@ -1,5 +1,13 @@
 import tweepy
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.twitter._auth import (
     TEST_CREDENTIALS,
     TEST_CREDENTIALS_INPUT,
@@ -9,13 +17,6 @@ from backend.blocks.twitter._auth import (
     TwitterCredentialsInput,
 )
 from backend.blocks.twitter.tweepy_exceptions import handle_tweepy_exception
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
-)
 from backend.data.model import SchemaField
 
 
@@ -54,6 +55,7 @@ class TwitterHideReplyBlock(Block):
                 ("success", True),
             ],
             test_mock={"hide_reply": lambda *args, **kwargs: True},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod
@@ -125,6 +127,7 @@ class TwitterUnhideReplyBlock(Block):
                 ("success", True),
             ],
             test_mock={"unhide_reply": lambda *args, **kwargs: True},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod

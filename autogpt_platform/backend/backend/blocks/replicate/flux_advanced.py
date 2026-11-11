@@ -4,19 +4,20 @@ from enum import Enum
 from pydantic import SecretStr
 from replicate.client import Client as ReplicateClient
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.replicate._auth import (
     TEST_CREDENTIALS,
     TEST_CREDENTIALS_INPUT,
     ReplicateCredentialsInput,
 )
 from backend.blocks.replicate._helper import ReplicateOutputs, extract_result
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
-)
 from backend.data.model import APIKeyCredentials, CredentialsField, SchemaField
 
 
@@ -144,6 +145,7 @@ class ReplicateFluxAdvancedModelBlock(Block):
                 "run_model": lambda api_key, model_name, prompt, seed, steps, guidance, interval, aspect_ratio, output_format, output_quality, safety_tolerance: "https://replicate.com/output/generated-image-url.jpg",
             },
             test_credentials=TEST_CREDENTIALS,
+            effect=BlockEffect.READ,
         )
 
     async def run(

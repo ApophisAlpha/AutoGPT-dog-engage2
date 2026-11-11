@@ -1,14 +1,19 @@
+import asyncio
+import io
 from pathlib import Path
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
 )
+from backend.data.execution import ExecutionContext
 from backend.data.model import ContributorDetails, SchemaField
 from backend.util.file import get_exec_file_path, store_media_file
+from backend.util.file_content_parser import check_xlsx_unpacked_size
 from backend.util.type import MediaFileType
 
 
@@ -24,6 +29,10 @@ class ReadSpreadsheetBlock(Block):
             description="CSV or Excel file to read from (URL, data URI, or local path). Excel files are automatically converted to CSV",
             default=None,
             advanced=False,
+        )
+        sheet_name: str | None = SchemaField(
+            description="Name of the worksheet to read from an Excel file. Defaults to the first sheet.",
+            default=None,
         )
         delimiter: str = SchemaField(
             description="The delimiter used in the CSV/spreadsheet data",
@@ -95,10 +104,11 @@ class ReadSpreadsheetBlock(Block):
                 ("row", {"a": "1", "b": "2", "c": "3"}),
                 ("row", {"a": "4", "b": "5", "c": "6"}),
             ],
+            effect=BlockEffect.READ,
         )
 
     async def run(
-        self, input_data: Input, *, graph_exec_id: str, user_id: str, **_kwargs
+        self, input_data: Input, *, execution_context: ExecutionContext, **_kwargs
     ) -> BlockOutput:
         import csv
         from io import StringIO
@@ -106,14 +116,16 @@ class ReadSpreadsheetBlock(Block):
         # Determine data source - prefer file_input if provided, otherwise use contents
         if input_data.file_input:
             stored_file_path = await store_media_file(
-                user_id=user_id,
-                graph_exec_id=graph_exec_id,
                 file=input_data.file_input,
-                return_content=False,
+                execution_context=execution_context,
+                return_format="for_local_processing",
             )
 
             # Get full file path
-            file_path = get_exec_file_path(graph_exec_id, stored_file_path)
+            assert execution_context.graph_exec_id  # Validated by store_media_file
+            file_path = get_exec_file_path(
+                execution_context.graph_exec_id, stored_file_path
+            )
             if not Path(file_path).exists():
                 raise ValueError(f"File does not exist: {file_path}")
 
@@ -123,16 +135,35 @@ class ReadSpreadsheetBlock(Block):
             if file_extension in [".xlsx", ".xls"]:
                 # Handle Excel files
                 try:
-                    from io import StringIO
-
                     import pandas as pd
 
-                    # Read Excel file
-                    df = pd.read_excel(file_path)
+                    def _read_xlsx() -> "pd.DataFrame":
+                        workbook = Path(file_path).read_bytes()
+                        check_xlsx_unpacked_size(
+                            io.BytesIO(workbook), source="spreadsheet_block"
+                        )
+                        # dtype=object and keep_default_na=False keep the sheet's own
+                        # values: "N/A"/"NULL"/"NaN" stay text instead of being read as
+                        # missing, and a gap in a numeric column no longer upcasts the
+                        # whole column to float (turning 12 into "12.0").
+                        return pd.read_excel(
+                            io.BytesIO(workbook),
+                            sheet_name=input_data.sheet_name or 0,
+                            dtype=object,
+                            keep_default_na=False,
+                        )
 
-                    # Convert to CSV string
+                    df = await asyncio.to_thread(_read_xlsx)
+
+                    # Write the CSV with the same dialect it is parsed with below,
+                    # otherwise a non-default delimiter yields a single column.
                     csv_buffer = StringIO()
-                    df.to_csv(csv_buffer, index=False)
+                    df.to_csv(
+                        csv_buffer,
+                        index=False,
+                        sep=input_data.delimiter,
+                        quotechar=input_data.quotechar,
+                    )
                     csv_content = csv_buffer.getvalue()
 
                 except ImportError:
@@ -170,7 +201,7 @@ class ReadSpreadsheetBlock(Block):
         def process_row(row):
             data = {}
             for i, value in enumerate(row):
-                if i not in input_data.skip_columns:
+                if str(i) not in input_data.skip_columns:
                     if input_data.has_header and header:
                         data[header[i]] = value.strip() if input_data.strip else value
                     else:

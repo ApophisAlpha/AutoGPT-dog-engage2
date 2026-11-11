@@ -5,16 +5,38 @@ on:
     branches: [master, dev]
     paths:
       - ".github/workflows/platform-frontend-ci.yml"
+      - ".github/scripts/validate_junit.py"
+      - ".github/scripts/test_validate_junit.py"
+      - ".github/scripts/validate_cobertura.py"
+      - ".github/scripts/test_validate_cobertura.py"
+      - ".github/scripts/test_frontend_cobertura_contract.py"
+      - ".github/scripts/run_unittest_junit.py"
       - "autogpt_platform/frontend/**"
+      # The Better Auth tables are Prisma's; auth-schema.test.ts checks them.
+      - "autogpt_platform/backend/schema.prisma"
+      - "autogpt_platform/backend/Dockerfile"
+      - "autogpt_platform/docker-compose.yml"
+      - "autogpt_platform/docker-compose.platform.yml"
   pull_request:
     paths:
       - ".github/workflows/platform-frontend-ci.yml"
+      - ".github/scripts/validate_junit.py"
+      - ".github/scripts/test_validate_junit.py"
+      - ".github/scripts/validate_cobertura.py"
+      - ".github/scripts/test_validate_cobertura.py"
+      - ".github/scripts/test_frontend_cobertura_contract.py"
+      - ".github/scripts/run_unittest_junit.py"
       - "autogpt_platform/frontend/**"
+      # The Better Auth tables are Prisma's; auth-schema.test.ts checks them.
+      - "autogpt_platform/backend/schema.prisma"
+      - "autogpt_platform/backend/Dockerfile"
+      - "autogpt_platform/docker-compose.yml"
+      - "autogpt_platform/docker-compose.platform.yml"
   merge_group:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && format('merge-queue-{0}', github.ref) || format('{0}-{1}', github.ref, github.event.pull_request.number || github.sha) }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || github.event_name == 'merge_group' && format('merge-queue-{0}', github.ref) || format('{0}-{1}', github.ref, github.event.pull_request.number || github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
@@ -23,104 +45,144 @@ defaults:
     working-directory: autogpt_platform/frontend
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      cache-key: ${{ steps.cache-key.outputs.key }}
-
+  tooltip-browser:
+    # Pinned: Playwright has no Chromium build for ubuntu-latest's 26.04 image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 11
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          node-version: "22.18.0"
-
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Generate cache key
-        id: cache-key
-        run: echo "key=${{ runner.os }}-pnpm-${{ hashFiles('autogpt_platform/frontend/pnpm-lock.yaml', 'autogpt_platform/frontend/package.json') }}" >> $GITHUB_OUTPUT
-
-      - name: Cache dependencies
-        uses: actions/cache@v4
+          package_json_file: autogpt_platform/frontend/package.json
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          path: ~/.pnpm-store
-          key: ${{ steps.cache-key.outputs.key }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-${{ hashFiles('autogpt_platform/frontend/pnpm-lock.yaml') }}
-            ${{ runner.os }}-pnpm-
-
+          node-version: "24.22.1"
+          cache: "pnpm"
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Install Chromium
+        # No --with-deps: the runner image already has Chromium's libraries, and the
+        # apt fetch it adds can outlast the job's timeout when Ubuntu's mirror is slow.
+        run: pnpm exec playwright install chromium
+      - name: Test tooltip browser interactions
+        run: pnpm test:tooltip
+      - name: Upload browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tooltip-browser-failures
+          path: autogpt_platform/frontend/test-results/
 
   lint:
     runs-on: ubuntu-latest
-    needs: setup
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          node-version: "22.18.0"
+          ref: ${{ github.sha }}
 
-      - name: Enable corepack
-        run: corepack enable
+      - name: Test coverage report validator
+        run: >-
+          python3 ../../.github/scripts/run_unittest_junit.py
+          --start-directory ../../.github/scripts
+          --pattern 'test_*cobertura*.py'
+          --suite-name frontend-coverage-validator
+          --output coverage-validator-tests.xml
 
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
+      - name: Upload coverage validator test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          path: ~/.pnpm-store
-          key: ${{ needs.setup.outputs.cache-key }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-${{ hashFiles('autogpt_platform/frontend/pnpm-lock.yaml') }}
-            ${{ runner.os }}-pnpm-
+          name: frontend-coverage-validator-tests
+          path: autogpt_platform/frontend/coverage-validator-tests.xml
+          if-no-files-found: error
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          package_json_file: autogpt_platform/frontend/package.json
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.22.1"
+          cache: "pnpm"
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: Run lint
         run: pnpm lint
 
-  chromatic:
+  knip:
     runs-on: ubuntu-latest
-    needs: setup
-    # Only run on dev branch pushes or PRs targeting dev
-    if: github.ref == 'refs/heads/dev' || github.base_ref == 'dev'
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+        with:
+          package_json_file: autogpt_platform/frontend/package.json
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "24.22.1"
+          cache: "pnpm"
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # knip resolves imports into the generated client, which is gitignored.
+      - name: Generate API client
+        run: pnpm generate:api
+
+      # Reports unused files, exports and dependencies. Informational for now:
+      # the codebase has a backlog of findings, so they must not block PRs.
+      # Scoped to this step so install/generate failures still fail the job.
+      - name: Run knip
+        continue-on-error: true
+        run: pnpm knip --no-progress --reporter markdown | tee -a "$GITHUB_STEP_SUMMARY"
+
+  chromatic:
+    runs-on: ubuntu-latest
+    # Disabled. Re-enable only for github.ref == 'refs/heads/dev' || github.base_ref == 'dev'
+    # and a paths-filter match on autogpt_platform/frontend/src/components/**.
+    if: ${{ false }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          node-version: "22.18.0"
+          package_json_file: autogpt_platform/frontend/package.json
 
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          path: ~/.pnpm-store
-          key: ${{ needs.setup.outputs.cache-key }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-${{ hashFiles('autogpt_platform/frontend/pnpm-lock.yaml') }}
-            ${{ runner.os }}-pnpm-
+          node-version: "24.22.1"
+          cache: "pnpm"
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Run Chromatic
-        uses: chromaui/action@latest
+        uses: chromaui/action@882b4728513a3720bfcd27bd9ad1260c603c6090 # v18.13.2
         with:
           projectToken: chpt_9e7c1a76478c9c8
           onlyChanged: true
@@ -128,133 +190,81 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           exitOnceUploaded: true
 
-  test:
-    runs-on: big-boi
-    needs: setup
+  integration_test:
+    name: integration_test (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
-          node-version: "22.18.0"
+          package_json_file: autogpt_platform/frontend/package.json
 
-      - name: Enable corepack
-        run: corepack enable
-
-      - name: Copy default supabase .env
-        run: |
-          cp ../.env.default ../.env
-
-      - name: Copy backend .env and set OpenAI API key
-        run: |
-          cp ../backend/.env.default ../backend/.env
-          echo "OPENAI_INTERNAL_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> ../backend/.env
-        env:
-          # Used by E2E test data script to generate embeddings for approved store agents
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v4
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-frontend-test-${{ hashFiles('autogpt_platform/docker-compose.yml', 'autogpt_platform/backend/Dockerfile', 'autogpt_platform/backend/pyproject.toml', 'autogpt_platform/backend/poetry.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-frontend-test-
-
-      - name: Run docker compose
-        run: |
-          NEXT_PUBLIC_PW_TEST=true docker compose -f ../docker-compose.yml up -d
-        env:
-          DOCKER_BUILDKIT: 1
-          BUILDX_CACHE_FROM: type=local,src=/tmp/.buildx-cache
-          BUILDX_CACHE_TO: type=local,dest=/tmp/.buildx-cache-new,mode=max
-
-      - name: Move cache
-        run: |
-          rm -rf /tmp/.buildx-cache
-          if [ -d "/tmp/.buildx-cache-new" ]; then
-            mv /tmp/.buildx-cache-new /tmp/.buildx-cache
-          fi
-
-      - name: Wait for services to be ready
-        run: |
-          echo "Waiting for rest_server to be ready..."
-          timeout 60 sh -c 'until curl -f http://localhost:8006/health 2>/dev/null; do sleep 2; done' || echo "Rest server health check timeout, continuing..."
-          echo "Waiting for database to be ready..."
-          timeout 60 sh -c 'until docker compose -f ../docker-compose.yml exec -T db pg_isready -U postgres 2>/dev/null; do sleep 2; done' || echo "Database ready check timeout, continuing..."
-
-      - name: Create E2E test data
-        run: |
-          echo "Creating E2E test data..."
-          # First try to run the script from inside the container
-          if docker compose -f ../docker-compose.yml exec -T rest_server test -f /app/autogpt_platform/backend/test/e2e_test_data.py; then
-            echo "✅ Found e2e_test_data.py in container, running it..."
-            docker compose -f ../docker-compose.yml exec -T rest_server sh -c "cd /app/autogpt_platform && python backend/test/e2e_test_data.py" || {
-              echo "❌ E2E test data creation failed!"
-              docker compose -f ../docker-compose.yml logs --tail=50 rest_server
-              exit 1
-            }
-          else
-            echo "⚠️ e2e_test_data.py not found in container, copying and running..."
-            # Copy the script into the container and run it
-            docker cp ../backend/test/e2e_test_data.py $(docker compose -f ../docker-compose.yml ps -q rest_server):/tmp/e2e_test_data.py || {
-              echo "❌ Failed to copy script to container"
-              exit 1
-            }
-            docker compose -f ../docker-compose.yml exec -T rest_server sh -c "cd /app/autogpt_platform && python /tmp/e2e_test_data.py" || {
-              echo "❌ E2E test data creation failed!"
-              docker compose -f ../docker-compose.yml logs --tail=50 rest_server
-              exit 1
-            }
-          fi
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.pnpm-store
-          key: ${{ needs.setup.outputs.cache-key }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-${{ hashFiles('autogpt_platform/frontend/pnpm-lock.yaml') }}
-            ${{ runner.os }}-pnpm-
+          node-version: "24.22.1"
+          cache: "pnpm"
+          cache-dependency-path: autogpt_platform/frontend/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --prefer-offline
 
-      - name: Install Browser 'chromium'
-        run: pnpm playwright install --with-deps chromium
+      - name: Generate API client
+        run: pnpm generate:api
 
-      - name: Run Playwright tests
-        run: pnpm test:no-build
-        continue-on-error: false
+      - name: Run Integration Tests
+        run: >-
+          pnpm exec vitest run
+          --coverage
+          --coverage.reportOnFailure
+          --shard=${{ matrix.shard }}/4
+          --reporter=default
+          --reporter=github-actions
+          --reporter=junit
+          --outputFile.junit=./junit.xml
 
-      - name: Upload Playwright report
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Validate JUnit test report
+        if: ${{ always() }}
+        run: >-
+          python3 ../../.github/scripts/validate_junit.py
+          --synthesize-invalid
+          --require-no-skips
+          junit.xml
+
+      - name: Validate coverage report
+        id: validate-frontend-coverage
+        if: ${{ always() }}
+        run: >-
+          python3 ../../.github/scripts/validate_cobertura.py
+          coverage/cobertura-coverage.xml
+
+      - name: Upload machine-readable test results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: playwright-report
-          path: playwright-report
-          if-no-files-found: ignore
-          retention-days: 3
+          name: frontend-integration-shard-${{ matrix.shard }}-of-4
+          path: |
+            autogpt_platform/frontend/junit.xml
+            autogpt_platform/frontend/coverage/cobertura-coverage.xml
+          if-no-files-found: error
 
-      - name: Upload Playwright test results
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Upload coverage reports to Codecov
+        if: ${{ !cancelled() && steps.validate-frontend-coverage.outcome == 'success' }}
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
         with:
-          name: playwright-test-results
-          path: test-results
-          if-no-files-found: ignore
-          retention-days: 3
-
-      - name: Print Final Docker Compose logs
-        if: always()
-        run: docker compose -f ../docker-compose.yml logs
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: platform-frontend
+          files: ./autogpt_platform/frontend/coverage/cobertura-coverage.xml
+          disable_search: true
+          name: frontend-shard-${{ matrix.shard }}-of-4

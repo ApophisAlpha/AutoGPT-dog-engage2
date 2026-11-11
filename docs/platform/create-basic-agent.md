@@ -4,6 +4,40 @@
 
 This guide walks through creating a simple question-answer AI agent using AutoGPT's visual builder. This is a basic example that can be expanded into more complex agents.
 
+## **Prerequisites**
+
+### **Cloud-Hosted AutoGPT**
+If you're using the cloud-hosted version at [agpt.co](https://agpt.co), you're ready to go! AI blocks come with **built-in credits** — no API keys required to get started. If you'd prefer to use your own API keys, you can add them via **Profile → Integrations**.
+
+### **Self-Hosted (Docker)**
+If you're running AutoGPT yourself, you'll need to add your own API keys. Where they go depends on how you installed it.
+
+**Docker Hub image** (`significantgravitas/autogpt`): the backend reads these keys from the container's environment. Put them in an environment file, for example `autogpt.env` (or pass each one with `-e`):
+
+```bash
+# autogpt.env
+OPENAI_API_KEY=sk-your-key-here
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+# Add other provider keys as needed
+```
+
+Then replace the container so it starts with those keys, keeping the same `autogpt-data` volume:
+```bash
+docker stop autogpt && docker rm autogpt
+# then rerun your original docker run command with --env-file autogpt.env added
+```
+
+**Appliance installer**: add the keys to the installer's private `autogpt.env`, then recreate the container as described in [Runtime Configuration](installer.md#runtime-configuration).
+
+**Docker Compose from source**: add the same keys to `autogpt_platform/backend/.env`, then restart the services from `autogpt_platform/`:
+```bash
+docker compose down && docker compose up -d
+```
+
+AutoPilot has its own provider settings; see [Models and memory](single-container.md#models-and-memory).
+
+**Note:** The Calculator example below doesn't require any API credentials — it's a good way to test your setup before adding AI blocks.
+
 ## **Example Agent: Q&A (with AI)**
 
 A step-by-step guide to creating a simple Q&A agent using input and output blocks.

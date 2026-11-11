@@ -5,26 +5,34 @@ This module provides blocks for creating and managing enrichments on webset item
 allowing extraction of additional structured data from existing items.
 """
 
+import time
+from asyncio import sleep
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from exa_py import AsyncExa
 from exa_py.websets.types import WebsetEnrichment as SdkWebsetEnrichment
 from pydantic import BaseModel
 
+from backend.blocks._platform_credentials import refuse_platform_credentials
 from backend.sdk import (
     APIKeyCredentials,
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
     CredentialsMetaInput,
-    Requests,
     SchemaField,
 )
 
 from ._config import exa
+from .helpers import merge_exa_cost
+from .websets_api import ExaWebsetsBlockBase, segment
+from .websets_payloads import options_payload
+
+ENRICHMENT_DONE_STATUSES = ("completed", "canceled", "failed")
 
 
 # Mirrored model for stability
@@ -34,12 +42,12 @@ class WebsetEnrichmentModel(BaseModel):
     id: str
     webset_id: str
     status: str
-    title: Optional[str]
+    title: str | None
     description: str
     format: str
-    options: List[str]
-    instructions: Optional[str]
-    metadata: Dict[str, Any]
+    options: list[str]
+    instructions: str | None
+    metadata: dict[str, Any]
     created_at: str
     updated_at: str
 
@@ -89,10 +97,13 @@ class EnrichmentFormat(str, Enum):
     OPTIONS = "options"  # Multiple choice from provided options
     EMAIL = "email"  # Email address format
     PHONE = "phone"  # Phone number format
+    URL = "url"  # A web address
 
 
-class ExaCreateEnrichmentBlock(Block):
+class ExaCreateEnrichmentBlock(ExaWebsetsBlockBase):
     """Create a new enrichment to extract additional data from webset items."""
+
+    refuses_platform_credentials = True
 
     class Input(BlockSchemaInput):
         credentials: CredentialsMetaInput = exa.credentials_field(
@@ -103,29 +114,29 @@ class ExaCreateEnrichmentBlock(Block):
             placeholder="webset-id-or-external-id",
         )
         description: str = SchemaField(
-            description="What data to extract from each item",
+            description="What data to extract from each item (up to 5,000 characters)",
             placeholder="Extract the company's main product or service offering",
         )
-        title: Optional[str] = SchemaField(
+        title: str | None = SchemaField(
             default=None,
-            description="Short title for this enrichment (auto-generated if not provided)",
+            description="Not part of Exa's current API: Exa generates the title from the description and format. Sent as-is if set.",
             placeholder="Main Product",
         )
         format: EnrichmentFormat = SchemaField(
             default=EnrichmentFormat.TEXT,
-            description="Expected format of the extracted data",
+            description="Expected format of the extracted data: text, date, number, options (pick from a list), email, phone or url",
         )
         options: list[str] = SchemaField(
             default_factory=list,
-            description="Available options when format is 'options'",
+            description="Labels to choose from when format is 'options' (1-150)",
             placeholder='["B2B", "B2C", "Both", "Unknown"]',
             advanced=True,
         )
         apply_to_existing: bool = SchemaField(
             default=True,
-            description="Apply this enrichment to existing items in the webset",
+            description="Exa always enriches existing and future items; this only controls whether 'wait for completion' waits for them",
         )
-        metadata: Optional[dict] = SchemaField(
+        metadata: dict | None = SchemaField(
             default=None,
             description="Metadata to attach to the enrichment",
             advanced=True,
@@ -158,11 +169,11 @@ class ExaCreateEnrichmentBlock(Block):
         instructions: str = SchemaField(
             description="Generated instructions for the enrichment"
         )
-        items_enriched: Optional[int] = SchemaField(
-            description="Number of items enriched (if wait_for_completion was True)"
+        items_enriched: int | None = SchemaField(
+            description="Number of items enriched (if wait_for_completion and apply_to_existing were both True)"
         )
-        completion_time: Optional[float] = SchemaField(
-            description="Time taken to complete in seconds (if wait_for_completion was True)"
+        completion_time: float | None = SchemaField(
+            description="Time taken to complete in seconds (if wait_for_completion and apply_to_existing were both True)"
         )
 
     def __init__(self):
@@ -172,14 +183,14 @@ class ExaCreateEnrichmentBlock(Block):
             categories={BlockCategory.AI, BlockCategory.SEARCH},
             input_schema=ExaCreateEnrichmentBlock.Input,
             output_schema=ExaCreateEnrichmentBlock.Output,
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
-        import time
-
         # Build the payload
+        refuse_platform_credentials(self, credentials)
         payload: dict[str, Any] = {
             "description": input_data.description,
             "format": input_data.format.value,
@@ -191,7 +202,7 @@ class ExaCreateEnrichmentBlock(Block):
 
         # Add options for 'options' format
         if input_data.format == EnrichmentFormat.OPTIONS and input_data.options:
-            payload["options"] = [{"label": opt} for opt in input_data.options]
+            payload["options"] = options_payload(input_data.options)
 
         # Add metadata if provided
         if input_data.metadata:
@@ -202,9 +213,10 @@ class ExaCreateEnrichmentBlock(Block):
         # Use AsyncExa SDK
         aexa = AsyncExa(api_key=credentials.api_key.get_secret_value())
 
-        sdk_enrichment = aexa.websets.enrichments.create(
+        sdk_enrichment = await aexa.websets.enrichments.create(
             webset_id=input_data.webset_id, params=payload
         )
+        merge_exa_cost(self, sdk_enrichment)
 
         enrichment_id = sdk_enrichment.id
         status = (
@@ -215,30 +227,26 @@ class ExaCreateEnrichmentBlock(Block):
 
         # If wait_for_completion is True and apply_to_existing is True, poll for completion
         if input_data.wait_for_completion and input_data.apply_to_existing:
-            import asyncio
-
             poll_interval = 5
             max_interval = 30
             poll_start = time.time()
             items_enriched = 0
 
             while time.time() - poll_start < input_data.polling_timeout:
-                current_enrich = aexa.websets.enrichments.get(
+                current_enrich = await aexa.websets.enrichments.get(
                     webset_id=input_data.webset_id, id=enrichment_id
                 )
+                merge_exa_cost(self, current_enrich)
                 current_status = (
                     current_enrich.status.value
                     if hasattr(current_enrich.status, "value")
                     else str(current_enrich.status)
                 )
 
-                if current_status in ["completed", "failed", "cancelled"]:
+                if current_status in ENRICHMENT_DONE_STATUSES:
                     # Estimate items from webset searches
-                    webset = aexa.websets.get(id=input_data.webset_id)
-                    if webset.searches:
-                        for search in webset.searches:
-                            if search.progress:
-                                items_enriched += search.progress.found
+                    webset = await self._get_webset(credentials, input_data.webset_id)
+                    items_enriched = webset.items_found
                     completion_time = time.time() - start_time
 
                     yield "enrichment_id", enrichment_id
@@ -252,7 +260,7 @@ class ExaCreateEnrichmentBlock(Block):
                     yield "completion_time", completion_time
                     return
 
-                await asyncio.sleep(poll_interval)
+                await sleep(poll_interval)
                 poll_interval = min(poll_interval * 1.5, max_interval)
 
             # Timeout
@@ -278,6 +286,8 @@ class ExaCreateEnrichmentBlock(Block):
 
 class ExaGetEnrichmentBlock(Block):
     """Get the status and details of a webset enrichment."""
+
+    refuses_platform_credentials = True
 
     class Input(BlockSchemaInput):
         credentials: CredentialsMetaInput = exa.credentials_field(
@@ -321,17 +331,20 @@ class ExaGetEnrichmentBlock(Block):
             categories={BlockCategory.SEARCH},
             input_schema=ExaGetEnrichmentBlock.Input,
             output_schema=ExaGetEnrichmentBlock.Output,
+            effect=BlockEffect.READ,
         )
 
     async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         # Use AsyncExa SDK
+        refuse_platform_credentials(self, credentials)
         aexa = AsyncExa(api_key=credentials.api_key.get_secret_value())
 
-        sdk_enrichment = aexa.websets.enrichments.get(
+        sdk_enrichment = await aexa.websets.enrichments.get(
             webset_id=input_data.webset_id, id=input_data.enrichment_id
         )
+        merge_exa_cost(self, sdk_enrichment)
 
         enrichment = WebsetEnrichmentModel.from_sdk(sdk_enrichment)
 
@@ -347,8 +360,10 @@ class ExaGetEnrichmentBlock(Block):
         yield "metadata", enrichment.metadata
 
 
-class ExaUpdateEnrichmentBlock(Block):
+class ExaUpdateEnrichmentBlock(ExaWebsetsBlockBase):
     """Update an existing enrichment configuration."""
+
+    refuses_platform_credentials = True
 
     class Input(BlockSchemaInput):
         credentials: CredentialsMetaInput = exa.credentials_field(
@@ -362,19 +377,19 @@ class ExaUpdateEnrichmentBlock(Block):
             description="The ID of the enrichment to update",
             placeholder="enrichment-id",
         )
-        description: Optional[str] = SchemaField(
+        description: str | None = SchemaField(
             default=None,
-            description="New description for what data to extract",
+            description="New description for what data to extract (up to 5,000 characters)",
         )
-        format: Optional[EnrichmentFormat] = SchemaField(
+        format: EnrichmentFormat | None = SchemaField(
             default=None,
-            description="New format for the extracted data",
+            description="New format: text, date, number, options, email, phone or url",
         )
-        options: Optional[list[str]] = SchemaField(
+        options: list[str] | None = SchemaField(
             default=None,
-            description="New options when format is 'options'",
+            description="New labels to choose from when format is 'options' (1-150)",
         )
-        metadata: Optional[dict] = SchemaField(
+        metadata: dict | None = SchemaField(
             default=None,
             description="New metadata to attach to the enrichment",
         )
@@ -396,16 +411,17 @@ class ExaUpdateEnrichmentBlock(Block):
             categories={BlockCategory.SEARCH},
             input_schema=ExaUpdateEnrichmentBlock.Input,
             output_schema=ExaUpdateEnrichmentBlock.Output,
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
-        url = f"https://api.exa.ai/websets/v0/websets/{input_data.webset_id}/enrichments/{input_data.enrichment_id}"
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": credentials.api_key.get_secret_value(),
-        }
+        refuse_platform_credentials(self, credentials)
+        path = (
+            f"/websets/{segment(input_data.webset_id)}"
+            f"/enrichments/{segment(input_data.enrichment_id)}"
+        )
 
         # Build the update payload
         payload = {}
@@ -417,30 +433,25 @@ class ExaUpdateEnrichmentBlock(Block):
             payload["format"] = input_data.format.value
 
         if input_data.options is not None:
-            payload["options"] = [{"label": opt} for opt in input_data.options]
+            payload["options"] = options_payload(input_data.options)
 
         if input_data.metadata is not None:
             payload["metadata"] = input_data.metadata
 
-        try:
-            response = await Requests().patch(url, headers=headers, json=payload)
-            data = response.json()
+        data = await self._api(credentials, "PATCH", path, json=payload)
 
-            yield "enrichment_id", data.get("id", "")
-            yield "status", data.get("status", "")
-            yield "title", data.get("title", "")
-            yield "description", data.get("description", "")
-            yield "format", data.get("format", "")
-            yield "success", "true"
-
-        except ValueError as e:
-            # Re-raise user input validation errors
-            raise ValueError(f"Failed to update enrichment: {e}") from e
-        # Let all other exceptions propagate naturally
+        yield "enrichment_id", data.get("id", "")
+        yield "status", data.get("status", "")
+        yield "title", data.get("title") or ""
+        yield "description", data.get("description", "")
+        yield "format", data.get("format") or ""
+        yield "success", "true"
 
 
 class ExaDeleteEnrichmentBlock(Block):
     """Delete an enrichment from a webset."""
+
+    refuses_platform_credentials = True
 
     class Input(BlockSchemaInput):
         credentials: CredentialsMetaInput = exa.credentials_field(
@@ -466,17 +477,21 @@ class ExaDeleteEnrichmentBlock(Block):
             categories={BlockCategory.SEARCH},
             input_schema=ExaDeleteEnrichmentBlock.Input,
             output_schema=ExaDeleteEnrichmentBlock.Output,
+            is_irreversible_action=True,
+            effect=BlockEffect.EXTERNAL,
         )
 
     async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         # Use AsyncExa SDK
+        refuse_platform_credentials(self, credentials)
         aexa = AsyncExa(api_key=credentials.api_key.get_secret_value())
 
-        deleted_enrichment = aexa.websets.enrichments.delete(
+        deleted_enrichment = await aexa.websets.enrichments.delete(
             webset_id=input_data.webset_id, id=input_data.enrichment_id
         )
+        merge_exa_cost(self, deleted_enrichment)
 
         yield "enrichment_id", deleted_enrichment.id
         yield "success", "true"
@@ -484,6 +499,8 @@ class ExaDeleteEnrichmentBlock(Block):
 
 class ExaCancelEnrichmentBlock(Block):
     """Cancel a running enrichment operation."""
+
+    refuses_platform_credentials = True
 
     class Input(BlockSchemaInput):
         credentials: CredentialsMetaInput = exa.credentials_field(
@@ -517,23 +534,27 @@ class ExaCancelEnrichmentBlock(Block):
             categories={BlockCategory.SEARCH},
             input_schema=ExaCancelEnrichmentBlock.Input,
             output_schema=ExaCancelEnrichmentBlock.Output,
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     async def run(
         self, input_data: Input, *, credentials: APIKeyCredentials, **kwargs
     ) -> BlockOutput:
         # Use AsyncExa SDK
+        refuse_platform_credentials(self, credentials)
         aexa = AsyncExa(api_key=credentials.api_key.get_secret_value())
 
-        canceled_enrichment = aexa.websets.enrichments.cancel(
+        canceled_enrichment = await aexa.websets.enrichments.cancel(
             webset_id=input_data.webset_id, id=input_data.enrichment_id
         )
+        merge_exa_cost(self, canceled_enrichment)
 
         # Try to estimate how many items were enriched before cancellation
         items_enriched = 0
-        items_response = aexa.websets.items.list(
+        items_response = await aexa.websets.items.list(
             webset_id=input_data.webset_id, limit=100
         )
+        merge_exa_cost(self, items_response)
 
         for sdk_item in items_response.data:
             # Check if this enrichment is present

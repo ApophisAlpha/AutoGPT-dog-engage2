@@ -1,29 +1,29 @@
+import asyncio
 import io
 import logging
 from enum import Enum
 
+from fastapi import HTTPException
+from PIL import Image
 from prisma.models import AgentGraph
 from replicate.client import Client as ReplicateClient
 from replicate.exceptions import ReplicateError
 from replicate.helpers import FileOutput
 
-from backend.blocks.ideogram import (
-    AspectRatio,
-    ColorPalettePreset,
-    IdeogramModelBlock,
-    IdeogramModelName,
-    MagicPromptOption,
-    StyleType,
-    UpscaleOption,
-)
-from backend.data.graph import BaseGraph
+from backend.data.graph import GraphBaseMeta
 from backend.data.model import CredentialsMetaInput, ProviderName
+from backend.data.redis_client import get_redis_async
+from backend.data.redis_helpers import incr_with_ttl
 from backend.integrations.credentials_store import ideogram_credentials
+from backend.monitoring.instrumentation import record_rate_limit_hit
 from backend.util.request import Requests
 from backend.util.settings import Settings
 
 logger = logging.getLogger(__name__)
 settings = Settings()
+# Per-user cap on agent thumbnails generated with the platform's provider key.
+# Documented in docs/platform/rate-limits.md: update it with any change here.
+DAILY_LIMIT = 25
 
 
 class ImageSize(str, Enum):
@@ -34,34 +34,88 @@ class ImageStyle(str, Enum):
     DIGITAL_ART = "digital art"
 
 
-async def generate_agent_image(agent: BaseGraph | AgentGraph) -> io.BytesIO:
+async def generate_agent_image(
+    agent: GraphBaseMeta | AgentGraph, user_id: str
+) -> io.BytesIO:
+    """Generate a JPEG thumbnail, independent of the provider's image format.
+
+    Each call counts against `user_id`'s daily allowance, and raises
+    HTTPException 429 once it is used up, or 503 if it cannot be checked.
+    """
+    await _reserve_generation(user_id)
     if settings.config.use_agent_image_generation_v2:
-        return await generate_agent_image_v2(graph=agent)
+        image = await _generate_agent_image_v2(graph=agent)
     else:
-        return await generate_agent_image_v1(agent=agent)
+        image = await _generate_agent_image_v1(agent=agent)
+    return await asyncio.to_thread(_as_jpeg, image)
 
 
-async def generate_agent_image_v2(graph: BaseGraph | AgentGraph) -> io.BytesIO:
+async def _reserve_generation(user_id: str) -> None:
+    try:
+        async with asyncio.timeout(3):
+            redis = await get_redis_async()
+            count = await incr_with_ttl(
+                redis, f"agent-image-limit:{user_id}", 24 * 60 * 60
+            )
+    except Exception as exc:
+        raise HTTPException(
+            503, "Agent image generation is temporarily unavailable"
+        ) from exc
+    if count > DAILY_LIMIT:
+        record_rate_limit_hit("agent_image_generation", user_id)
+        raise HTTPException(
+            429, f"Limit: {DAILY_LIMIT} generated agent images per day."
+        )
+
+
+def _as_jpeg(image: io.BytesIO) -> io.BytesIO:
+    content = image.getvalue()
+    with Image.open(io.BytesIO(content)) as generated:
+        if generated.format == "JPEG":
+            return io.BytesIO(content)
+        rgba = generated.convert("RGBA")
+        background = Image.new("RGB", generated.size, "white")
+        background.paste(rgba, mask=rgba.getchannel("A"))
+        output = io.BytesIO()
+        background.save(output, format="JPEG", quality=90)
+    output.seek(0)
+    return output
+
+
+async def _generate_agent_image_v2(graph: GraphBaseMeta | AgentGraph) -> io.BytesIO:
     """
     Generate an image for an agent using Ideogram model.
     Returns:
-        str: The URL of the generated image
+        io.BytesIO: The image bytes in the provider's original format.
     """
     if not ideogram_credentials.api_key:
         raise ValueError("Missing Ideogram API key")
+
+    from backend.blocks.ideogram import (
+        AspectRatio,
+        ColorPalettePreset,
+        IdeogramModelBlock,
+        IdeogramModelName,
+        MagicPromptOption,
+        StyleType,
+        UpscaleOption,
+    )
 
     name = graph.name
     description = f"{name} ({graph.description})" if graph.description else name
 
     prompt = (
-        f"Create a visually striking retro-futuristic vector pop art illustration prominently featuring "
-        f'"{name}" in bold typography. The image clearly and literally depicts a {description}, '
-        f"along with recognizable objects directly associated with the primary function of a {name}. "
-        f"Ensure the imagery is concrete, intuitive, and immediately understandable, clearly conveying the "
-        f"purpose of a {name}. Maintain vibrant, limited-palette colors, sharp vector lines, geometric "
-        f"shapes, flat illustration techniques, and solid colors without gradients or shading. Preserve a "
-        f"retro-futuristic aesthetic influenced by mid-century futurism and 1960s psychedelia, "
-        f"prioritizing clear visual storytelling and thematic clarity above all else."
+        "Create a visually striking retro-futuristic vector pop art illustration "
+        f'prominently featuring "{name}" in bold typography. The image clearly and '
+        f"literally depicts a {description}, along with recognizable objects directly "
+        f"associated with the primary function of a {name}. "
+        f"Ensure the imagery is concrete, intuitive, and immediately understandable, "
+        f"clearly conveying the purpose of a {name}. "
+        "Maintain vibrant, limited-palette colors, sharp vector lines, "
+        "geometric shapes, flat illustration techniques, and solid colors "
+        "without gradients or shading. Preserve a retro-futuristic aesthetic "
+        "influenced by mid-century futurism and 1960s psychedelia, "
+        "prioritizing clear visual storytelling and thematic clarity above all else."
     )
 
     custom_colors = [
@@ -99,12 +153,12 @@ async def generate_agent_image_v2(graph: BaseGraph | AgentGraph) -> io.BytesIO:
     return io.BytesIO(response.content)
 
 
-async def generate_agent_image_v1(agent: BaseGraph | AgentGraph) -> io.BytesIO:
+async def _generate_agent_image_v1(agent: GraphBaseMeta | AgentGraph) -> io.BytesIO:
     """
     Generate an image for an agent using Flux model via Replicate API.
 
     Args:
-        agent (Graph): The agent to generate an image for
+        agent (GraphBaseMeta | AgentGraph): The agent to generate an image for
 
     Returns:
         io.BytesIO: The generated image as bytes
@@ -114,7 +168,13 @@ async def generate_agent_image_v1(agent: BaseGraph | AgentGraph) -> io.BytesIO:
             raise ValueError("Missing Replicate API key in settings")
 
         # Construct prompt from agent details
-        prompt = f"Create a visually engaging app store thumbnail for the AI agent that highlights what it does in a clear and captivating way:\n- **Name**: {agent.name}\n- **Description**: {agent.description}\nFocus on showcasing its core functionality with an appealing design."
+        prompt = (
+            "Create a visually engaging app store thumbnail for the AI agent "
+            "that highlights what it does in a clear and captivating way:\n"
+            f"- **Name**: {agent.name}\n"
+            f"- **Description**: {agent.description}\n"
+            f"Focus on showcasing its core functionality with an appealing design."
+        )
 
         # Set up Replicate client
         client = ReplicateClient(api_token=settings.secrets.replicate_api_key)

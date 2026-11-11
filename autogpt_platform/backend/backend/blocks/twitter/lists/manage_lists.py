@@ -3,6 +3,14 @@ from typing import cast
 import tweepy
 from tweepy.client import Response
 
+from backend.blocks._base import (
+    Block,
+    BlockCategory,
+    BlockEffect,
+    BlockOutput,
+    BlockSchemaInput,
+    BlockSchemaOutput,
+)
 from backend.blocks.twitter._auth import (
     TEST_CREDENTIALS,
     TEST_CREDENTIALS_INPUT,
@@ -12,13 +20,6 @@ from backend.blocks.twitter._auth import (
     TwitterCredentialsInput,
 )
 from backend.blocks.twitter.tweepy_exceptions import handle_tweepy_exception
-from backend.data.block import (
-    Block,
-    BlockCategory,
-    BlockOutput,
-    BlockSchemaInput,
-    BlockSchemaOutput,
-)
 from backend.data.model import SchemaField
 
 
@@ -52,6 +53,8 @@ class TwitterDeleteListBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("success", True)],
             test_mock={"delete_list": lambda *args, **kwargs: True},
+            is_irreversible_action=True,
+            effect=BlockEffect.EXTERNAL,
         )
 
     @staticmethod
@@ -135,6 +138,7 @@ class TwitterUpdateListBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("success", True)],
             test_mock={"update_list": lambda *args, **kwargs: True},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod
@@ -233,6 +237,7 @@ class TwitterCreateListBlock(Block):
                 ("url", "https://twitter.com/i/lists/1234567890"),
             ],
             test_mock={"create_list": lambda *args, **kwargs: ("1234567890")},
+            effect=BlockEffect.EXTERNAL_JUDGED,
         )
 
     @staticmethod

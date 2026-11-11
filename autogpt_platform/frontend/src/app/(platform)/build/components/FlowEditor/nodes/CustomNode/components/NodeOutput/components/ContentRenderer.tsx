@@ -2,6 +2,7 @@
 
 import type { OutputMetadata } from "@/components/contextual/OutputRenderers";
 import { globalRegistry } from "@/components/contextual/OutputRenderers";
+import { Text } from "@/components/atoms/Text/Text";
 
 export const TextRenderer: React.FC<{
   value: any;
@@ -14,7 +15,18 @@ export const TextRenderer: React.FC<{
       ? text.slice(0, truncateLengthLimit) + "..."
       : text;
 
-  return <div className="break-words bg-zinc-50 p-3 text-xs">{truncated}</div>;
+  return (
+    <div className="bg-surface-muted p-3">
+      <Text
+        variant="small-tight"
+        tone="inherit"
+        as="div"
+        className="break-words"
+      >
+        {truncated}
+      </Text>
+    </div>
+  );
 };
 
 export const ContentRenderer: React.FC<{
@@ -34,18 +46,21 @@ export const ContentRenderer: React.FC<{
   if (
     renderer?.name === "ImageRenderer" ||
     renderer?.name === "VideoRenderer" ||
+    renderer?.name === "WorkspaceFileRenderer" ||
+    renderer?.name === "AudioRenderer" ||
+    renderer?.name === "LinkRenderer" ||
     !shortContent
   ) {
     return (
-      <div className="[&>*]:rounded-xlarge [&>*]:!text-xs">
+      <div className="overflow-x-auto [&_pre]:break-words [&_pre]:whitespace-pre-wrap [&>*]:rounded-xlarge [&>*]:!text-caption [&>*]:!leading-4">
         {renderer?.render(value, metadata)}
       </div>
     );
   }
 
   return (
-    <div className="[&>*]:rounded-xlarge [&>*]:!text-xs">
-      <TextRenderer value={value} truncateLengthLimit={100} />
+    <div className="overflow-x-auto [&>*]:rounded-xlarge">
+      <TextRenderer value={value} truncateLengthLimit={200} />
     </div>
   );
 };

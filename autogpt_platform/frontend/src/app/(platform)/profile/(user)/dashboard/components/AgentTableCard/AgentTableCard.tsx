@@ -1,103 +1,100 @@
 "use client";
 
 import Image from "next/image";
-import { IconStarFilled, IconMore } from "@/components/__legacy__/ui/icons";
+import { isLocalStoreMediaUrl } from "@/lib/store-media";
+import {
+  MoreVerticalGlyph,
+  StarFilledGlyph,
+} from "@/components/atoms/Icon/drawnIcons";
 import { StoreSubmission } from "@/app/api/__generated__/models/storeSubmission";
-import { SubmissionStatus } from "@/app/api/__generated__/models/submissionStatus";
-import { Status } from "@/components/__legacy__/Status";
+import { SubmissionStatus } from "../SubmissionStatus/SubmissionStatus";
+import { ImageNotFound01Icon } from "@hugeicons/core-free-icons";
+import { Icon } from "@/components/atoms/Icon/Icon";
+import { useImageFallback } from "@/hooks/useImageFallback";
 
 export interface AgentTableCardProps {
-  agent_id: string;
-  agent_version: number;
-  agentName: string;
-  sub_heading: string;
-  description: string;
-  imageSrc: string[];
-  dateSubmitted: Date;
-  status: SubmissionStatus;
-  runs: number;
-  rating: number;
-  id: number;
-  listing_id?: string;
+  storeAgentSubmission: StoreSubmission;
   onViewSubmission: (submission: StoreSubmission) => void;
 }
 
 export const AgentTableCard = ({
-  agent_id,
-  agent_version,
-  agentName,
-  sub_heading,
-  description,
-  imageSrc,
-  dateSubmitted,
-  status,
-  runs,
-  rating,
-  listing_id,
+  storeAgentSubmission,
   onViewSubmission,
 }: AgentTableCardProps) => {
   const onView = () => {
-    onViewSubmission({
-      listing_id: listing_id || "",
-      agent_id,
-      agent_version,
-      slug: "",
-      name: agentName,
-      sub_heading,
-      description,
-      image_urls: imageSrc,
-      date_submitted: dateSubmitted,
-      status: status,
-      runs,
-      rating,
-    });
+    onViewSubmission(storeAgentSubmission);
   };
 
+  const {
+    graph_version,
+    name: agentName,
+    description,
+    image_urls,
+    submitted_at,
+    status,
+    run_count,
+    review_avg_rating: rating,
+  } = storeAgentSubmission;
+
+  const { showImage, handleImageError } = useImageFallback(image_urls?.[0]);
+
   return (
-    <div className="border-b border-neutral-300 p-4 dark:border-neutral-700">
+    <div className="border-b border-border-strong p-4">
       <div className="flex gap-4">
-        <div className="relative aspect-video w-24 shrink-0 overflow-hidden rounded-lg bg-[#d9d9d9] dark:bg-neutral-800">
-          <Image
-            src={imageSrc?.[0] ?? "/nada.png"}
-            alt={agentName}
-            fill
-            style={{ objectFit: "cover" }}
-          />
+        <div className="relative flex aspect-video w-24 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-surface-hover text-foreground-emphasis">
+          {showImage && image_urls?.[0] ? (
+            <Image
+              src={image_urls[0]}
+              unoptimized={isLocalStoreMediaUrl(image_urls[0])}
+              alt={agentName}
+              fill
+              className="object-cover"
+              onError={handleImageError}
+            />
+          ) : (
+            <Icon icon={ImageNotFound01Icon} className="h-6 w-6" />
+          )}
         </div>
         <div className="flex-1">
           <div className="flex items-center gap-2">
-            <h3 className="text-[15px] font-medium text-neutral-800 dark:text-neutral-200">
+            <h3 className="text-body-md leading-inherit font-medium text-foreground-emphasis">
               {agentName}
             </h3>
-            <span className="text-[13px] text-neutral-500 dark:text-neutral-400">
-              v{agent_version}
+            <span className="text-body-sm leading-inherit text-foreground-tertiary">
+              v{graph_version}
             </span>
           </div>
-          <p className="line-clamp-2 text-sm text-neutral-600 dark:text-neutral-400">
+          <p className="line-clamp-2 text-body text-foreground-secondary">
             {description}
           </p>
         </div>
         <button
           onClick={onView}
-          className="h-fit rounded-full p-1 hover:bg-neutral-100 dark:hover:bg-neutral-700"
+          className="h-fit rounded-full p-1 text-foreground-emphasis hover:bg-surface-hover"
         >
-          <IconMore className="h-5 w-5 text-neutral-800 dark:text-neutral-200" />
+          <Icon
+            icon={MoreVerticalGlyph}
+            aria-label="Icon"
+            viewBox="0 0 20 20"
+            strokeWidth={1.5}
+            className="h-5 w-5"
+          />
         </button>
       </div>
 
       <div className="mt-4 flex flex-wrap gap-4">
-        <Status status={status} />
-        <div className="text-sm text-neutral-600 dark:text-neutral-400">
-          {dateSubmitted.toLocaleDateString()}
+        <SubmissionStatus status={status} />
+        <div className="text-body text-foreground-secondary">
+          {submitted_at && submitted_at.toLocaleDateString()}
         </div>
-        <div className="text-sm text-neutral-600 dark:text-neutral-400">
-          {runs.toLocaleString()} runs
+        <div className="text-body text-foreground-secondary">
+          {(run_count ?? 0).toLocaleString()} runs
         </div>
-        <div className="flex items-center gap-1">
-          <span className="text-sm font-medium text-neutral-800 dark:text-neutral-200">
-            {rating.toFixed(1)}
+        <div className="flex items-center gap-1 text-foreground-emphasis">
+          <span className="text-body font-medium text-foreground-emphasis">
+            {(rating ?? 0).toFixed(1)}
           </span>
-          <IconStarFilled className="h-4 w-4 text-neutral-800 dark:text-neutral-200" />
+          <Icon icon={StarFilledGlyph} aria-label="Icon" className="h-4 w-4" />
         </div>
       </div>
     </div>

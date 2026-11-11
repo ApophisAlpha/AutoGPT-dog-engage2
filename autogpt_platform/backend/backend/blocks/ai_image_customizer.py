@@ -1,4 +1,3 @@
-import asyncio
 from enum import Enum
 from typing import Literal
 
@@ -6,13 +5,15 @@ from pydantic import SecretStr
 from replicate.client import Client as ReplicateClient
 from replicate.helpers import FileOutput
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
 )
+from backend.data.execution import ExecutionContext
 from backend.data.model import (
     APIKeyCredentials,
     CredentialsField,
@@ -20,12 +21,13 @@ from backend.data.model import (
     SchemaField,
 )
 from backend.integrations.providers import ProviderName
-from backend.util.file import MediaFileType, store_media_file
+from backend.util.file import MediaFileType, check_total_file_size, store_media_file
 
 
 class GeminiImageModel(str, Enum):
     NANO_BANANA = "google/nano-banana"
     NANO_BANANA_PRO = "google/nano-banana-pro"
+    NANO_BANANA_2 = "google/nano-banana-2"
 
 
 class AspectRatio(str, Enum):
@@ -76,7 +78,7 @@ class AIImageCustomizerBlock(Block):
         )
         model: GeminiImageModel = SchemaField(
             description="The AI model to use for image generation and editing",
-            default=GeminiImageModel.NANO_BANANA,
+            default=GeminiImageModel.NANO_BANANA_2,
             title="Model",
         )
         images: list[MediaFileType] = SchemaField(
@@ -102,7 +104,7 @@ class AIImageCustomizerBlock(Block):
         super().__init__(
             id="d76bbe4c-930e-4894-8469-b66775511f71",
             description=(
-                "Generate and edit custom images using Google's Nano-Banana model from Gemini 2.5. "
+                "Generate and edit custom images using Google's Nano-Banana models from Gemini. "
                 "Provide a prompt and optional reference images to create or modify images."
             ),
             categories={BlockCategory.AI, BlockCategory.MULTIMEDIA},
@@ -110,21 +112,24 @@ class AIImageCustomizerBlock(Block):
             output_schema=AIImageCustomizerBlock.Output,
             test_input={
                 "prompt": "Make the scene more vibrant and colorful",
-                "model": GeminiImageModel.NANO_BANANA,
+                "model": GeminiImageModel.NANO_BANANA_2,
                 "images": [],
                 "aspect_ratio": AspectRatio.MATCH_INPUT_IMAGE,
                 "output_format": OutputFormat.JPG,
                 "credentials": TEST_CREDENTIALS_INPUT,
             },
             test_output=[
-                ("image_url", "https://replicate.delivery/generated-image.jpg"),
+                # Output will be a workspace ref or data URI depending on context
+                ("image_url", lambda x: x.startswith(("workspace://", "data:"))),
             ],
             test_mock={
+                # Use data URI to avoid HTTP requests during tests
                 "run_model": lambda *args, **kwargs: MediaFileType(
-                    "https://replicate.delivery/generated-image.jpg"
+                    "data:image/jpeg;base64,/9j/4AAQSkZJRgABAgAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q=="
                 ),
             },
             test_credentials=TEST_CREDENTIALS,
+            effect=BlockEffect.WORKSPACE,
         )
 
     async def run(
@@ -132,23 +137,23 @@ class AIImageCustomizerBlock(Block):
         input_data: Input,
         *,
         credentials: APIKeyCredentials,
-        graph_exec_id: str,
-        user_id: str,
+        execution_context: ExecutionContext,
         **kwargs,
     ) -> BlockOutput:
         try:
             # Convert local file paths to Data URIs (base64) so Replicate can access them
-            processed_images = await asyncio.gather(
-                *(
-                    store_media_file(
-                        graph_exec_id=graph_exec_id,
-                        file=img,
-                        user_id=user_id,
-                        return_content=True,
-                    )
-                    for img in input_data.images
+            # One at a time, so the total is checked before the next is loaded.
+            processed_images: list[MediaFileType] = []
+            total_size = 0
+            for img in input_data.images:
+                data_uri = await store_media_file(
+                    file=img,
+                    execution_context=execution_context,
+                    return_format="for_external_api",  # Get content for Replicate API
                 )
-            )
+                total_size += len(data_uri)
+                check_total_file_size(total_size)
+                processed_images.append(data_uri)
 
             result = await self.run_model(
                 api_key=credentials.api_key,
@@ -158,7 +163,14 @@ class AIImageCustomizerBlock(Block):
                 aspect_ratio=input_data.aspect_ratio.value,
                 output_format=input_data.output_format.value,
             )
-            yield "image_url", result
+
+            # Store the generated image to the user's workspace for persistence
+            stored_url = await store_media_file(
+                file=result,
+                execution_context=execution_context,
+                return_format="for_block_output",
+            )
+            yield "image_url", stored_url
         except Exception as e:
             yield "error", str(e)
 

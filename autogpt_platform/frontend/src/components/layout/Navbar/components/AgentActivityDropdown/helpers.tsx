@@ -1,6 +1,5 @@
 import { AgentExecutionStatus } from "@/app/api/__generated__/models/agentExecutionStatus";
 import { GraphExecutionMeta as GeneratedGraphExecutionMeta } from "@/app/api/__generated__/models/graphExecutionMeta";
-import { MyAgent } from "@/app/api/__generated__/models/myAgent";
 import type { GraphExecution } from "@/lib/autogpt-server-api/types";
 
 // Time constants
@@ -64,33 +63,6 @@ export interface NotificationState {
   totalCount: number;
 }
 
-export function createAgentInfoMap(
-  agents: MyAgent[],
-): Map<
-  string,
-  { name: string; description: string; library_agent_id?: string }
-> {
-  const agentMap = new Map<
-    string,
-    { name: string; description: string; library_agent_id?: string }
-  >();
-
-  agents.forEach((agent) => {
-    // Ensure we have valid agent data
-    const agentName =
-      agent.agent_name || `Agent ${agent.agent_id?.slice(0, 8)}`;
-    const agentDescription = agent.description || "";
-
-    agentMap.set(agent.agent_id, {
-      name: agentName,
-      description: agentDescription,
-      library_agent_id: undefined, // MyAgent doesn't have library_agent_id
-    });
-  });
-
-  return agentMap;
-}
-
 export function enrichExecutionWithAgentInfo(
   execution: GeneratedGraphExecutionMeta,
   agentInfoMap: Map<
@@ -102,7 +74,7 @@ export function enrichExecutionWithAgentInfo(
 
   return {
     ...execution,
-    agent_name: agentInfo?.name ?? "Unknown Agent",
+    agent_name: agentInfo?.name ?? "Unknown Workflow",
     agent_description: agentInfo?.description ?? "",
     library_agent_id: agentInfo?.library_agent_id,
   };
@@ -196,6 +168,24 @@ export function categorizeExecutions(
       activeExecutions.length +
       recentCompletions.length +
       recentFailures.length,
+  };
+}
+
+export function relabelNotifications(
+  state: NotificationState,
+  agentInfoMap: Map<
+    string,
+    { name: string; description: string; library_agent_id?: string }
+  >,
+): NotificationState {
+  function relabel(execution: AgentExecutionWithInfo) {
+    return enrichExecutionWithAgentInfo(execution, agentInfoMap);
+  }
+  return {
+    ...state,
+    activeExecutions: state.activeExecutions.map(relabel),
+    recentCompletions: state.recentCompletions.map(relabel),
+    recentFailures: state.recentFailures.map(relabel),
   };
 }
 

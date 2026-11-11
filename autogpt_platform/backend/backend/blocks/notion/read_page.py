@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
@@ -48,6 +49,7 @@ class NotionReadPageBlock(Block):
             test_mock={
                 "get_page": lambda *args, **kwargs: {"object": "page", "id": "mocked"}
             },
+            effect=BlockEffect.READ,
         )
 
     @staticmethod

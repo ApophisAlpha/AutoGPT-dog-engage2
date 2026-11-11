@@ -3,17 +3,20 @@ import socket
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Literal
+from typing import BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
-from backend.data.block import (
+from backend.blocks._base import (
     Block,
     BlockCategory,
+    BlockEffect,
     BlockOutput,
     BlockSchemaInput,
     BlockSchemaOutput,
 )
+from backend.blocks.helpers.host_bound_login import login_may_go_to
+from backend.data.credential_scope import ServerTarget
 from backend.data.model import (
     CredentialsField,
     CredentialsMetaInput,
@@ -21,12 +24,14 @@ from backend.data.model import (
     UserPasswordCredentials,
 )
 from backend.integrations.providers import ProviderName
+from backend.util.request import resolve_and_check_blocked
 
 TEST_CREDENTIALS = UserPasswordCredentials(
     id="01234567-89ab-cdef-0123-456789abcdef",
     provider="smtp",
     username=SecretStr("mock-smtp-username"),
     password=SecretStr("mock-smtp-password"),
+    scope="smtp://smtp.gmail.com",
     title="Mock SMTP credentials",
 )
 
@@ -96,7 +101,11 @@ class SendEmailBlock(Block):
             test_credentials=TEST_CREDENTIALS,
             test_output=[("status", "Email sent successfully")],
             test_mock={"send_email": lambda *args, **kwargs: "Email sent successfully"},
+            is_irreversible_action=True,
+            effect=BlockEffect.EXTERNAL,
         )
+
+    ALLOWED_SMTP_PORTS = {25, 465, 587, 2525}
 
     @staticmethod
     def send_email(
@@ -117,7 +126,7 @@ class SendEmailBlock(Block):
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
-        with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
+        with _BoundedSMTP(smtp_server, smtp_port, timeout=30) as server:
             server.starttls()
             server.login(smtp_username, smtp_password)
             server.sendmail(smtp_username, to_email, msg.as_string())
@@ -125,9 +134,43 @@ class SendEmailBlock(Block):
         return "Email sent successfully"
 
     async def run(
-        self, input_data: Input, *, credentials: SMTPCredentials, **kwargs
+        self,
+        input_data: Input,
+        *,
+        credentials: SMTPCredentials,
+        user_id: str | None = None,
+        graph_id: str | None = None,
+        graph_version: int | None = None,
+        **kwargs,
     ) -> BlockOutput:
         try:
+            # --- SSRF Protection ---
+            smtp_port = input_data.config.smtp_port
+            if smtp_port not in self.ALLOWED_SMTP_PORTS:
+                yield "error", (
+                    f"SMTP port {smtp_port} is not allowed. "
+                    f"Allowed ports: {sorted(self.ALLOWED_SMTP_PORTS)}"
+                )
+                return
+
+            # A saved login is only sent to the server its scope names.
+            if not await login_may_go_to(
+                credentials,
+                ServerTarget(
+                    scheme="smtp", host=input_data.config.smtp_server, port=smtp_port
+                ),
+                user_id=user_id,
+                graph_id=graph_id,
+                graph_version=graph_version,
+            ):
+                yield "error", _refusal(
+                    credentials,
+                    f"'{input_data.config.smtp_server}' on port {smtp_port}",
+                )
+                return
+
+            await resolve_and_check_blocked(input_data.config.smtp_server)
+
             status = self.send_email(
                 config=input_data.config,
                 to_email=input_data.to_email,
@@ -179,7 +222,69 @@ class SendEmailBlock(Block):
                 "was rejected by the server. "
                 "Please verify your account is authorized to send emails."
             )
+        except smtplib.SMTPConnectError:
+            yield "error", (
+                f"Cannot connect to SMTP server '{input_data.config.smtp_server}' "
+                f"on port {input_data.config.smtp_port}."
+            )
+        except smtplib.SMTPServerDisconnected:
+            yield "error", (
+                f"SMTP server '{input_data.config.smtp_server}' "
+                "disconnected unexpectedly."
+            )
         except smtplib.SMTPDataError as e:
             yield "error", f"Email data rejected by server: {str(e)}"
+        except ValueError as e:
+            yield "error", str(e)
         except Exception as e:
             raise e
+
+
+def _refusal(credentials: SMTPCredentials, server: str) -> str:
+    if credentials.scope is None:
+        why = (
+            "were saved without a server, so they can only be used in workflows "
+            "you saved yourself"
+        )
+    else:
+        why = f"are saved for a different server than this workflow's ({server})"
+    return (
+        f"The selected SMTP credentials {why}, so they were not sent. Each saved "
+        "login is only sent to the server it was saved for; check which server "
+        "your saved SMTP logins are for."
+    )
+
+
+class _BoundedSMTP(smtplib.SMTP):
+    """``smtplib.SMTP`` that caps the size of one server reply."""
+
+    MAX_REPLY_BYTES = 1024 * 1024  # a real reply is a few KB
+
+    def getreply(self):
+        # smtplib opens the reply stream lazily, and again after STARTTLS.
+        if self.file is None and self.sock is not None:
+            self.file = _BoundedReplyStream(
+                self.sock.makefile("rb"), self.MAX_REPLY_BYTES
+            )
+        if isinstance(self.file, _BoundedReplyStream):
+            self.file.reply_bytes = 0
+        return super().getreply()
+
+
+class _BoundedReplyStream:
+    def __init__(self, file: BinaryIO, max_reply_bytes: int):
+        self._file = file
+        self._max_reply_bytes = max_reply_bytes
+        self.reply_bytes = 0
+
+    def readline(self, size: int = -1) -> bytes:
+        line = self._file.readline(size)
+        self.reply_bytes += len(line)
+        if self.reply_bytes > self._max_reply_bytes:
+            # An OSError makes getreply() close the connection and raise
+            # SMTPServerDisconnected, which run() reports.
+            raise OSError("SMTP reply too long")
+        return line
+
+    def close(self) -> None:
+        self._file.close()
